@@ -1,4 +1,4 @@
-"""core.py — پارس اکسل کدال با تشخیص فرمت و متن‌کاوی"""
+"""core.py — پارس اکسل کدال با تشخیص کامل و fallback"""
 import re
 import io
 import pandas as pd
@@ -36,29 +36,83 @@ def safe_div(a, b):
 def safe_add(*vs): return np.nan if any(pd.isna(v) for v in vs) else float(sum(vs))
 def safe_mul(a, b): return np.nan if pd.isna(a) or pd.isna(b) else a * b
 
-# ═══════════════ خواندن هوشمند فایل ═══════════════
-def read_excel_safe(content_bytes):
-    """تشخیص فرمت با magic number و امتحان engine های مختلف."""
-    if not content_bytes or len(content_bytes) < 8:
-        return None
-    magic = content_bytes[:4]
+# ═══════════════ تشخیص کامل فایل ═══════════════
+def diagnose_file(content_bytes):
+    """برمی‌گرداند (xls_or_None, errors_list, hex_preview, size, kind)"""
+    if not content_bytes:
+        return None, ["فایل خالی (۰ بایت)"], "", 0, "empty"
 
+    size = len(content_bytes)
+    hex_preview = content_bytes[:80].hex()
+
+    if size < 8:
+        return None, [f"فایل خیلی کوچک: {size} بایت"], hex_preview, size, "tiny"
+
+    magic = content_bytes[:8]
+
+    # تشخیص نوع
     if magic[:2] == b'PK':
+        kind = "xlsx (zip)"
         engines = ['openpyxl', 'calamine', 'xlrd']
-    elif magic == b'\xd0\xcf\x11\xe0':
+    elif magic[:4] == b'\xd0\xcf\x11\xe0':
+        kind = "xls (OLE2)"
         engines = ['xlrd', 'calamine', 'openpyxl']
+    elif magic[:5] == b'<?xml':
+        kind = "xml"
+        engines = ['openpyxl', 'calamine']
+    elif b'<html' in content_bytes[:500].lower() or b'<table' in content_bytes[:500].lower():
+        kind = "html"
+        engines = []
     else:
-        engines = ['openpyxl', 'xlrd', 'calamine', None]
+        kind = "unknown"
+        engines = ['openpyxl', 'xlrd', 'calamine']
+
+    errors = []
 
     for engine in engines:
         try:
-            return pd.ExcelFile(io.BytesIO(content_bytes), engine=engine)
+            xls = pd.ExcelFile(io.BytesIO(content_bytes), engine=engine)
+            return xls, errors, hex_preview, size, kind
+        except Exception as e:
+            errors.append(f"[{engine}] {str(e)[:180]}")
+
+    # آخرین تلاش: auto-detect
+    if engines:
+        try:
+            xls = pd.ExcelFile(io.BytesIO(content_bytes))
+            return xls, errors, hex_preview, size, kind
+        except Exception as e:
+            errors.append(f"[auto] {str(e)[:180]}")
+
+    return None, errors, hex_preview, size, kind
+
+def try_parse_html(content_bytes):
+    """اگر فایل HTML است، جداول را به DataFrame تبدیل می‌کند."""
+    try:
+        dfs = pd.read_html(io.BytesIO(content_bytes))
+        if dfs:
+            return dfs[0]
+    except Exception:
+        pass
+    return None
+
+def try_parse_csv(content_bytes):
+    """اگر فایل متنی است، به عنوان CSV/TSV تلاش می‌کند."""
+    for encoding in ['utf-8', 'utf-8-sig', 'windows-1256', 'latin-1']:
+        try:
+            text = content_bytes.decode(encoding, errors='ignore')
+            for sep in ['\t', ';', ',']:
+                try:
+                    df = pd.read_csv(io.StringIO(text), sep=sep, header=None, on_bad_lines='skip')
+                    if df.shape[1] > 1 and df.shape[0] > 2:
+                        return df
+                except Exception:
+                    continue
         except Exception:
             continue
     return None
 
 def numbers_after_label(text, label, max_nums=4):
-    """اعداد بعد از برچسب را در متن چسبیده پیدا می‌کند."""
     if not text or not label: return []
     text_en = to_en(str(text))
     search_start = 0
@@ -72,7 +126,6 @@ def numbers_after_label(text, label, max_nums=4):
         if not num_match:
             search_start = end_idx; continue
         before_num = preview[:num_match.start()]
-        # اگر قبل از عدد حرف فارسی هست → تطبیق ناقص
         if re.search(r'[\u0600-\u06FF]', before_num):
             search_start = end_idx; continue
         after = text_en[end_idx:end_idx + 400]
@@ -91,14 +144,26 @@ def extract_excel(file_like, labels):
         if hasattr(file_like, 'getvalue'):
             content = file_like.getvalue()
         elif hasattr(file_like, 'read'):
-            file_like.seek(0)
-            content = file_like.read()
+            file_like.seek(0); content = file_like.read()
         else:
             content = file_like
     except Exception:
         return out
 
-    xls = read_excel_safe(content)
+    xls, errors, hex_prev, size, kind = diagnose_file(content)
+
+    # Fallback ۱: HTML
+    if xls is None and kind == "html":
+        df_html = try_parse_html(content)
+        if df_html is not None and not df_html.empty:
+            return _extract_from_df(df_html, labels)
+
+    # Fallback ۲: CSV/TSV
+    if xls is None and kind in ("unknown", "tiny"):
+        df_csv = try_parse_csv(content)
+        if df_csv is not None and not df_csv.empty:
+            return _extract_from_df(df_csv, labels)
+
     if xls is None:
         return out
 
@@ -108,53 +173,63 @@ def extract_excel(file_like, labels):
         except Exception:
             continue
         if raw.empty: continue
+        _extract_from_raw(raw, labels, out)
 
-        # روش ۱: چندستونی
-        for hdr in range(min(15, len(raw))):
-            df = raw.iloc[hdr + 1:].reset_index(drop=True)
-            if df.empty or df.shape[1] < 2: continue
-            col_a_norm = df.iloc[:, 0].astype(str).map(norm_label)
-            for k, cands in labels.items():
-                if k in out and not pd.isna(out[k]): continue
-                for cand in cands:
-                    cn = norm_label(cand)
-                    mask = col_a_norm == cn
-                    if not mask.any() and len(cn) >= 4:
-                        mask = col_a_norm.str.contains(re.escape(cn), na=False)
-                    if not mask.any(): continue
-                    row = df[mask].iloc[0]
-                    nums = []
-                    for c in df.columns[1:15]:
-                        v = parse_num(row.get(c))
-                        if not pd.isna(v): nums.append(v)
-                        if len(nums) >= 2: break
+    return out
+
+def _extract_from_df(df, labels):
+    """استخراج ساده از یک DataFrame (HTML/CSV)."""
+    out = {}
+    if df.empty: return out
+    _extract_from_raw(df, labels, out)
+    return out
+
+def _extract_from_raw(raw, labels, out):
+    """استخراج از یک sheet خام — هم چندستونی، هم متن‌کاوی."""
+    # روش ۱: چندستونی
+    for hdr in range(min(15, len(raw))):
+        df = raw.iloc[hdr + 1:].reset_index(drop=True)
+        if df.empty or df.shape[1] < 2: continue
+        col_a_norm = df.iloc[:, 0].astype(str).map(norm_label)
+        for k, cands in labels.items():
+            if k in out and not pd.isna(out[k]): continue
+            for cand in cands:
+                cn = norm_label(cand)
+                mask = col_a_norm == cn
+                if not mask.any() and len(cn) >= 4:
+                    mask = col_a_norm.str.contains(re.escape(cn), na=False)
+                if not mask.any(): continue
+                row = df[mask].iloc[0]
+                nums = []
+                for c in df.columns[1:15]:
+                    v = parse_num(row.get(c))
+                    if not pd.isna(v): nums.append(v)
+                    if len(nums) >= 2: break
+                if nums:
+                    out[k] = nums[0]
+                    if len(nums) > 1: out[f"{k}_prev"] = nums[1]
+                    break
+
+    # روش ۲: متن‌کاوی
+    missing = [k for k in labels if k not in out or pd.isna(out.get(k))]
+    if not missing: return
+    for idx in range(len(raw)):
+        for col in raw.columns:
+            cell = raw.iloc[idx][col]
+            if pd.isna(cell): continue
+            text = str(cell)
+            if len(text) < 15: continue
+            for k in list(missing):
+                if k in out and not pd.isna(out[k]):
+                    if k in missing: missing.remove(k)
+                    continue
+                for cand in labels[k]:
+                    nums = numbers_after_label(text, cand)
                     if nums:
                         out[k] = nums[0]
                         if len(nums) > 1: out[f"{k}_prev"] = nums[1]
+                        if k in missing: missing.remove(k)
                         break
-
-        # روش ۲: متن‌کاوی (برای فایل‌های تک‌ستونی)
-        missing = [k for k in labels if k not in out or pd.isna(out.get(k))]
-        if missing:
-            for idx in range(len(raw)):
-                for col in raw.columns:
-                    cell = raw.iloc[idx][col]
-                    if pd.isna(cell): continue
-                    text = str(cell)
-                    if len(text) < 15: continue
-                    for k in list(missing):
-                        if k in out and not pd.isna(out[k]):
-                            if k in missing: missing.remove(k)
-                            continue
-                        for cand in labels[k]:
-                            nums = numbers_after_label(text, cand)
-                            if nums:
-                                out[k] = nums[0]
-                                if len(nums) > 1: out[f"{k}_prev"] = nums[1]
-                                if k in missing: missing.remove(k)
-                                break
-
-    return out
 
 # ═══════════════ برچسب‌ها ═══════════════
 BANK_LABELS = {
