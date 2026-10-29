@@ -5,7 +5,7 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-from core import SECTOR_CONFIG, extract_excel, diagnose_file, try_parse_html, try_parse_csv
+from core import (SECTOR_CONFIG, extract_excel, parse_any_format)
 
 st.set_page_config(page_title="داشبورد تحلیل سهام", page_icon="📊",
                    layout="wide", initial_sidebar_state="expanded")
@@ -41,26 +41,25 @@ def safe_pct(a, b):
         return np.nan
 
 GLOSSARY = [
-    ("P/E","نسبت قیمت به سود هر سهم"),
-    ("P/B","نسبت قیمت به ارزش دفتری"),
-    ("P/NAV","قیمت به خالص ارزش دارایی‌ها (برای هلدینگ)"),
-    ("NAV","Net Asset Value"),
-    ("ROA","بازده دارایی = سود خالص ÷ کل دارایی"),
-    ("ROE","بازده حقوق مالکانه"),
+    ("P/E","قیمت به سود هر سهم"),
+    ("P/B","قیمت به ارزش دفتری"),
+    ("P/NAV","قیمت به خالص ارزش دارایی‌ها"),
+    ("ROA","سود خالص ÷ کل دارایی"),
+    ("ROE","سود خالص ÷ حقوق مالکانه"),
     ("EPS","سود هر سهم"),
     ("BVPS","ارزش دفتری هر سهم"),
     ("DPS","سود نقدی هر سهم"),
-    ("Dividend Yield","بازده سود نقدی = DPS ÷ قیمت"),
+    ("Dividend Yield","DPS ÷ قیمت"),
     ("Payout Ratio","DPS ÷ EPS"),
-    ("LDR","تسهیلات ÷ سپرده (بانکی)"),
+    ("LDR","تسهیلات ÷ سپرده (بانک)"),
     ("NPL","مطالبات غیرجاری"),
-    ("Cost-to-Income","هزینه عملیاتی ÷ درآمد عملیاتی"),
-    ("EBITDA","سود قبل از بهره، مالیات و استهلاک"),
-    ("EV","ارزش شرکت = ارزش بازار + بدهی خالص"),
+    ("Cost-to-Income","هزینه ÷ درآمد عملیاتی"),
+    ("EBITDA","سود قبل از بهره، مالیات، استهلاک"),
+    ("EV","ارزش شرکت"),
     ("FCF","جریان نقد آزاد"),
-    ("DSO","دوره وصول مطالبات (روز)"),
-    ("DIO","دوره گردش موجودی (روز)"),
-    ("DPO","دوره پرداخت (روز)"),
+    ("DSO","دوره وصول مطالبات"),
+    ("DIO","دوره گردش موجودی"),
+    ("DPO","دوره پرداخت"),
     ("CCC","DSO + DIO − DPO"),
     ("TSR","بازده کل سهامدار"),
     ("Graham","√(22.5 × EPS × BVPS)"),
@@ -77,13 +76,14 @@ uploaded = st.sidebar.file_uploader(
     accept_multiple_files=True,
 )
 
-st.sidebar.subheader("💰 پارامترهای بازار")
-price = st.sidebar.number_input("قیمت روز سهم (تومان)", min_value=1.0, value=1000.0, step=10.0)
+st.sidebar.subheader("💰 پارامترها")
+price = st.sidebar.number_input("قیمت سهم (تومان)", min_value=1.0, value=1000.0, step=10.0)
 shares = st.sidebar.number_input("تعداد سهام (میلیارد)", min_value=0.01, value=30.0, step=0.1, format="%.2f")
-months = st.sidebar.selectbox("دوره صورت مالی (ماه)", [3, 6, 9, 12], index=3)
-dollar = st.sidebar.number_input("نرخ دلار (ریال) — اختیاری", min_value=0.0, value=700000.0, step=1000.0)
+months = st.sidebar.selectbox("دوره (ماه)", [3, 6, 9, 12], index=3)
+dollar = st.sidebar.number_input("دلار (ریال)", min_value=0.0, value=700000.0, step=1000.0)
 
-# ═══════════════════ پارس چند فایل ═══════════════════
+
+# ═══════════════ پارس ═══════════════
 data = {}
 file_report = []
 previews = {}
@@ -91,51 +91,55 @@ previews = {}
 if uploaded:
     with st.spinner(f"در حال پارس {len(uploaded)} فایل..."):
         for f in uploaded:
-            # خواندن بایت‌ها
             content = b""
-            read_error = None
             try:
-                if hasattr(f, 'getvalue'):
-                    content = f.getvalue()
+                if hasattr(f, 'getvalue'): content = f.getvalue()
                 elif hasattr(f, 'read'):
                     try: f.seek(0)
                     except: pass
                     content = f.read()
-                else:
-                    content = bytes(f)
+                else: content = bytes(f)
             except Exception as e:
-                read_error = str(e)
-
-            if read_error or not content:
                 file_report.append((f.name, 0, len(cfg["labels"]),
-                                    f"❌ خواندن شکست: {read_error or 'خالی'}", 0, "?", []))
-                previews[f.name] = {"type": "error", "errors": [read_error or "فایل خالی"],
-                                    "hex": "", "size": 0, "kind": "empty", "magic": "?"}
+                                    f"❌ خواندن شکست: {str(e)[:80]}", 0, "?", []))
+                previews[f.name] = {"type": "error", "errors": [str(e)[:200]],
+                                    "hex": "", "size": 0, "kind": "?", "magic": "?"}
                 continue
 
-            # تشخیص کامل
-            xls, errors, hex_prev, size, kind = diagnose_file(content)
-            magic_str = content[:8].hex() if len(content) >= 8 else content.hex()
+            if not content:
+                file_report.append((f.name, 0, len(cfg["labels"]), "❌ فایل خالی", 0, "?", []))
+                continue
 
-            if xls is None:
+            size = len(content)
+            magic_str = content[:8].hex()
+
+            result, kind, errors = parse_any_format(content)
+
+            if result is None:
                 file_report.append((f.name, 0, len(cfg["labels"]),
-                                    f"❌ ناموفق ({kind}, {size:,} بایت)", 0, magic_str, errors))
-                previews[f.name] = {"type": "error", "errors": errors, "hex": hex_prev,
-                                    "size": size, "kind": kind, "magic": magic_str}
+                                    f"❌ {kind}، {size:,} بایت", 0, magic_str, errors))
+                previews[f.name] = {"type": "error", "errors": errors,
+                                    "hex": content[:80].hex(), "size": size,
+                                    "kind": kind, "magic": magic_str}
                 continue
 
             # پیش‌نمایش
-            ncols = 0
-            sheet_names = xls.sheet_names
             try:
-                sample = pd.read_excel(xls, sheet_name=sheet_names[0], header=None, nrows=40)
-                ncols = sample.shape[1]
+                if isinstance(result, pd.ExcelFile):
+                    sample = pd.read_excel(result, sheet_name=result.sheet_names[0],
+                                           header=None, nrows=40)
+                    nsheets = len(result.sheet_names)
+                else:
+                    sample = result.head(40)
+                    nsheets = 1
+                ncols = sample.shape[1] if not sample.empty else 0
                 previews[f.name] = sample
             except Exception as e:
-                previews[f.name] = {"type": "error", "errors": [f"پیش‌نمایش شکست: {e}"],
-                                    "hex": hex_prev, "size": size, "kind": kind, "magic": magic_str}
                 file_report.append((f.name, 0, len(cfg["labels"]),
-                                    f"❌ پیش‌نمایش شکست: {str(e)[:80]}", 0, magic_str, []))
+                                    f"❌ پیش‌نمایش: {str(e)[:60]}", 0, magic_str, []))
+                previews[f.name] = {"type": "error", "errors": [str(e)[:200]],
+                                    "hex": content[:80].hex(), "size": size,
+                                    "kind": kind, "magic": magic_str}
                 continue
 
             structure = "چندستونی" if ncols > 3 else "تک‌ستونی"
@@ -145,34 +149,34 @@ if uploaded:
                 extracted = extract_excel(io.BytesIO(content), cfg["labels"])
             except Exception as e:
                 file_report.append((f.name, 0, len(cfg["labels"]),
-                                    f"❌ پارس شکست: {str(e)[:80]}", ncols, magic_str, []))
+                                    f"❌ پارس: {str(e)[:60]}", ncols, magic_str, []))
                 continue
 
             found = len([k for k, v in extracted.items() if not pd.isna(v)])
             total_fields = len(cfg["labels"])
             file_report.append((f.name, found, total_fields,
-                                f"{structure} ({ncols} ستون، {len(sheet_names)} شیت، {size:,} بایت)",
-                                ncols, magic_str, errors))
+                                f"{structure} ({ncols} ستون، {nsheets} شیت، {kind}، {size:,} بایت)",
+                                ncols, magic_str, []))
 
             for k, v in extracted.items():
                 if k not in data or pd.isna(data.get(k)):
                     data[k] = v
 
-# ═══════════════════ هشدار ═══════════════════
+
+# هشدار
 if uploaded and len([k for k, v in data.items() if not pd.isna(v)]) == 0:
     st.markdown(
-        f"<div class='bad-box'>🔴 <b>هیچ داده‌ای استخراج نشد.</b><br>"
-        f"در «📋 گزارش» و «🔬 نمای خام» ببینید چه اتفاقی افتاده — hex و خطای هر engine آنجاست.<br>"
-        f"در بدترین حالت، از تب «🔧 داده» مقادیر را دستی وارد کنید.</div>",
+        f"<div class='bad-box'>🔴 هیچ داده‌ای استخراج نشد — "
+        f"در «📋 گزارش» و «🔬 نمای خام» تشخیص هر فایل و خطاها را ببینید.</div>",
         unsafe_allow_html=True
     )
 
 ratios = cfg["fn"](data, p=price * 10, sh=shares * 1e9, m=months)
 
 st.title(f"📊 داشبورد تحلیل — {cfg['name']}")
-st.caption(f"قیمت: **{price:,.0f} تومان** | سهام: **{shares:.2f} میلیارد** | دوره: **{months} ماه** | دلار: **{dollar:,.0f} ریال** | فایل‌ها: **{len(uploaded) if uploaded else 0}**")
+st.caption(f"قیمت: **{price:,.0f} تومان** | سهام: **{shares:.2f} میلیارد** | دوره: **{months} ماه** | فایل‌ها: **{len(uploaded) if uploaded else 0}**")
 
-# ═══════════════════ گزارش + Debug ═══════════════════
+# گزارش + debug
 if file_report:
     with st.expander("📋 گزارش پارس هر فایل", expanded=True):
         for row in file_report:
@@ -181,47 +185,38 @@ if file_report:
             icon = "🟢" if pct >= 40 else ("🟡" if pct >= 10 else "🔴")
             st.write(f"{icon} **{fname}** — {found}/{total} ({pct}٪) — `{note}`")
 
-    with st.expander("🔬 نمای خام فایل (Debug)", expanded=True):
+    with st.expander("🔬 نمای خام فایل (Debug)", expanded=False):
         for fname, *_ in file_report:
             st.markdown(f"### `{fname}`")
             pv = previews.get(fname)
-
             if isinstance(pv, pd.DataFrame):
                 st.write(f"**ابعاد**: {pv.shape[0]} سطر × {pv.shape[1]} ستون")
-                st.dataframe(pv.head(40), use_container_width=True, height=350)
+                st.dataframe(pv, use_container_width=True, height=350)
             elif isinstance(pv, dict) and pv.get("type") == "error":
-                st.error(f"❌ قابل خواندن نیست — نوع تشخیص‌داده‌شده: `{pv['kind']}` — اندازه: {pv['size']:,} بایت")
+                st.error(f"❌ نوع: `{pv['kind']}` — {pv['size']:,} بایت")
                 c1, c2 = st.columns(2)
-                with c1:
-                    st.write("**magic (۸ بایت اول)**:")
-                    st.code(pv["magic"])
-                with c2:
-                    st.write("**۸۰ بایت اول (hex)**:")
-                    st.code(pv["hex"])
-                if pv["errors"]:
-                    st.write("**خطای هر engine:**")
-                    for err in pv["errors"]:
-                        st.code(err)
+                with c1: st.code(pv["magic"])
+                with c2: st.code(pv["hex"])
+                for err in pv["errors"]: st.code(err)
             else:
                 st.caption("پیش‌نمایش موجود نیست")
 
-# نوار پوشش
+# پوشش
 req = [k for k in cfg["labels"] if not k.endswith("_prev")]
 found_all = [k for k in req if not pd.isna(data.get(k))]
 miss = [k for k in req if pd.isna(data.get(k))]
 cov = int(len(found_all) / len(req) * 100) if req else 0
 c1, c2 = st.columns([3, 1])
-c1.progress(cov, text=f"پوشش کل: {len(found_all)}/{len(req)} ({cov}٪)")
+c1.progress(cov, text=f"پوشش: {len(found_all)}/{len(req)} ({cov}٪)")
 c2.caption("⚠️ فیلد گم — تب «داده»" if miss else "✅ کامل")
 
 if not pd.isna(data.get("net_income")) and data.get("net_income", 0) < 0:
     st.markdown("<div class='bad-box'>🔴 شرکت زیان‌ده است.</div>", unsafe_allow_html=True)
 
-# ═══════════════════ تب‌ها ═══════════════════
+# ═══════════════ تب‌ها ═══════════════
 T = st.tabs(["🏠 خلاصه", "📈 سود و زیان", "🏦 ترازنامه", "💰 ارزش‌گذاری",
              "👤 تحلیل سهامدار", "🔧 داده", "📖 واژه‌نامه"])
 
-# ─── تب ۱ ───
 with T[0]:
     st.subheader("شاخص‌های کلیدی")
     cols = st.columns(5)
@@ -245,7 +240,6 @@ with T[0]:
         st.subheader("🚩 پرچم‌ها")
         for f in flags: st.write(f)
 
-# ─── تب ۲ ───
 with T[1]:
     ni = data.get("net_income", 0) / 1e3
     if sk == "holding":
@@ -255,19 +249,9 @@ with T[1]:
         oex = abs(data.get("other_exp", 0)) / 1e3
         fin = abs(data.get("fin_cost", 0)) / 1e3
         oth = ni - (div + itr - sal - oex - fin)
-        x = ["درآمد سود سهام", "سود تضمین‌شده", "هزینه حقوق",
-             "سایر هزینه", "هزینه مالی", "سایر", "سود خالص"]
+        x = ["سود سهام","سود تضمین","هزینه حقوق","سایر هزینه","هزینه مالی","سایر","سود خالص"]
         y = [div, itr, -sal, -oex, -fin, oth, ni]
         meas = ["relative"] * 6 + ["total"]
-    elif sk == "bank":
-        oi = data.get("op_income", 0) / 1e3
-        dc = abs(data.get("deposit_cost", 0)) / 1e3
-        ac = abs(data.get("admin_cost", 0)) / 1e3
-        pv = abs(data.get("provision", 0)) / 1e3
-        oth = ni - (oi - dc - ac - pv)
-        x = ["درآمد عملیاتی", "هزینه سپرده", "هزینه اداری", "ذخیره", "سایر", "سود خالص"]
-        y = [oi, -dc, -ac, -pv, oth, ni]
-        meas = ["relative"] * 5 + ["total"]
     else:
         rev = data.get("revenue", 0) / 1e3
         cs = abs(data.get("cogs", 0)) / 1e3
@@ -275,9 +259,9 @@ with T[1]:
         fc = abs(data.get("fin_cost", 0)) / 1e3
         gp = rev - cs
         oth = ni - gp + sg + fc
-        x = ["فروش", "بهای تمام", "سود ناخالص", "هزینه فروش", "هزینه مالی", "سایر", "سود خالص"]
+        x = ["فروش","بهای تمام","سود ناخالص","هزینه فروش","هزینه مالی","سایر","سود خالص"]
         y = [rev, -cs, gp, -sg, -fc, oth, ni]
-        meas = ["relative", "relative", "total", "relative", "relative", "relative", "total"]
+        meas = ["relative","relative","total","relative","relative","relative","total"]
 
     fig = go.Figure(go.Waterfall(
         measure=meas, x=x, y=y,
@@ -290,7 +274,6 @@ with T[1]:
     fig.update_layout(height=440, showlegend=False, yaxis_title="همت")
     st.plotly_chart(fig, use_container_width=True)
 
-# ─── تب ۳ ───
 with T[2]:
     ta = data.get("total_assets", 0) / 1e3
     cash = data.get("cash", 0) / 1e3
@@ -300,28 +283,23 @@ with T[2]:
     if sk == "holding":
         li = data.get("long_inv", 0) / 1e3
         asc = data.get("associates", 0) / 1e3
-        labels = ["نقد", "سرمایه‌گذاری بلندمدت", "وابسته", "سایر"]
+        labels = ["نقد","سرمایه‌گذاری بلندمدت","وابسته","سایر"]
         vals = [cash, li, asc, max(0, ta - cash - li - asc)]
-    elif sk == "bank":
-        loans = data.get("total_loans", 0) / 1e3
-        labels = ["نقد", "تسهیلات", "سایر"]
-        vals = [cash, loans, max(0, ta - cash - loans)]
     else:
         inv = data.get("inventory", 0) / 1e3
         ar = data.get("receivables", 0) / 1e3
-        labels = ["نقد", "موجودی", "مطالبات", "سایر"]
+        labels = ["نقد","موجودی","مطالبات","سایر"]
         vals = [cash, inv, ar, max(0, ta - cash - inv - ar)]
 
     c1, c2 = st.columns(2)
     with c1:
-        fig = px.pie(values=vals, names=labels, hole=0.55,
-                     title="ترکیب دارایی‌ها (همت)",
+        fig = px.pie(values=vals, names=labels, hole=0.55, title="ترکیب دارایی (همت)",
                      color_discrete_sequence=px.colors.sequential.Blues_r)
         st.plotly_chart(fig, use_container_width=True)
     with c2:
-        fig = px.pie(values=[liab, eq], names=["بدهی", "حقوق مالکانه"], hole=0.55,
+        fig = px.pie(values=[liab, eq], names=["بدهی","حقوق مالکانه"], hole=0.55,
                      title="ساختار سرمایه (همت)",
-                     color_discrete_sequence=["#dc2626", "#16a34a"])
+                     color_discrete_sequence=["#dc2626","#16a34a"])
         st.plotly_chart(fig, use_container_width=True)
 
     st.subheader("📊 نسبت‌های ساختاری")
@@ -330,7 +308,6 @@ with T[2]:
     c2.metric("حقوق/دارایی", fmt(safe_pct(eq, ta), pct=True))
     c3.metric("نقد/دارایی", fmt(safe_pct(cash, ta), pct=True))
 
-# ─── تب ۴ ───
 with T[3]:
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("P/E", fmt(ratios.get("P/E"), dec=2))
@@ -364,7 +341,6 @@ with T[3]:
             fig.update_layout(height=380)
             st.plotly_chart(fig, use_container_width=True)
 
-# ─── تب ۵ ───
 with T[4]:
     st.header("👤 تحلیل سهامدار")
     eps_a = ratios.get("EPS سالانه (ریال)", np.nan)
@@ -422,12 +398,9 @@ with T[4]:
 
     st.subheader("⚠️ ریسک‌ها")
     risks = []
-    if not pd.isna(div_yield) and div_yield < 2:
-        risks.append("🔴 سود نقدی ناچیز")
-    if ratios.get("Debt/Equity", 0) > 2:
-        risks.append("🟡 اهرم بالا")
-    if not pd.isna(ratios.get("P/E")) and ratios.get("P/E", 0) > 10:
-        risks.append("🟡 P/E بالا")
+    if not pd.isna(div_yield) and div_yield < 2: risks.append("🔴 سود نقدی ناچیز")
+    if ratios.get("Debt/Equity", 0) > 2: risks.append("🟡 اهرم بالا")
+    if not pd.isna(ratios.get("P/E")) and ratios.get("P/E", 0) > 10: risks.append("🟡 P/E بالا")
     if not risks: risks.append("✅ ریسکی شناسایی نشد")
     for r in risks: st.write(r)
 
@@ -444,9 +417,8 @@ with T[4]:
     else: v, c = "🔴 پرریسک", "bad-box"
     st.markdown(f"<div class='{c}'><b>سیگنال:</b> {v} — {score}/6</div>", unsafe_allow_html=True)
 
-# ─── تب ۶ ───
 with T[5]:
-    st.subheader("✏️ داده (قابل ویرایش) — میلیون ریال")
+    st.subheader("✏️ داده (میلیون ریال)")
     rows = []
     for k, cands in cfg["labels"].items():
         cur = data.get(k, np.nan); prev = data.get(f"{k}_prev", np.nan)
@@ -454,7 +426,6 @@ with T[5]:
                      "جاری": None if pd.isna(cur) else float(cur),
                      "قبل": None if pd.isna(prev) else float(prev)})
     df_edit = pd.DataFrame(rows)
-
     edited = st.data_editor(df_edit, use_container_width=True, height=500, num_rows="fixed",
         column_config={
             "کلید": st.column_config.TextColumn(disabled=True),
@@ -462,7 +433,6 @@ with T[5]:
             "جاری": st.column_config.NumberColumn(format="%.0f"),
             "قبل": st.column_config.NumberColumn(format="%.0f"),
         }, key="editor")
-
     if st.button("✅ اعمال"):
         for _, row in edited.iterrows():
             k = row["کلید"]
@@ -479,15 +449,12 @@ with T[5]:
                        f"ratios_{sk}.csv", "text/csv")
 
     if miss:
-        st.subheader("⚠️ فیلدهای گم‌شده")
-        for m in miss:
-            st.write(f"🔴 `{m}`")
+        st.subheader("⚠️ فیلدهای گم")
+        for m in miss: st.write(f"🔴 `{m}`")
 
-# ─── تب ۷ ───
 with T[6]:
     st.header("📖 واژه‌نامه")
-    for en, fa in GLOSSARY:
-        st.markdown(f"**{en}** — {fa}")
+    for en, fa in GLOSSARY: st.markdown(f"**{en}** — {fa}")
 
 st.divider()
 st.caption("⚠️ ابزار تحلیلی است — توصیه سرمایه‌گذاری نیست.")
