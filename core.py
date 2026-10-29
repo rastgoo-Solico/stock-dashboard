@@ -1,4 +1,4 @@
-"""core.py — پارس اکسل کدال با تشخیص کامل و fallback"""
+"""core.py — پارس اکسل/HTML کدال با تشخیص کامل"""
 import re
 import io
 import pandas as pd
@@ -36,81 +36,161 @@ def safe_div(a, b):
 def safe_add(*vs): return np.nan if any(pd.isna(v) for v in vs) else float(sum(vs))
 def safe_mul(a, b): return np.nan if pd.isna(a) or pd.isna(b) else a * b
 
-# ═══════════════ تشخیص کامل فایل ═══════════════
-def diagnose_file(content_bytes):
-    """برمی‌گرداند (xls_or_None, errors_list, hex_preview, size, kind)"""
-    if not content_bytes:
-        return None, ["فایل خالی (۰ بایت)"], "", 0, "empty"
 
-    size = len(content_bytes)
-    hex_preview = content_bytes[:80].hex()
-
-    if size < 8:
-        return None, [f"فایل خیلی کوچک: {size} بایت"], hex_preview, size, "tiny"
+# ═══════════════ تشخیص و پارس هر فرمت ═══════════════
+def parse_any_format(content_bytes):
+    """برمی‌گرداند (result, kind, errors). result: ExcelFile|DataFrame|None"""
+    if not content_bytes or len(content_bytes) < 8:
+        return None, "empty", ["فایل خالی/خیلی کوچک"]
 
     magic = content_bytes[:8]
 
     # تشخیص نوع
     if magic[:2] == b'PK':
-        kind = "xlsx (zip)"
-        engines = ['openpyxl', 'calamine', 'xlrd']
+        kind = "xlsx"
     elif magic[:4] == b'\xd0\xcf\x11\xe0':
-        kind = "xls (OLE2)"
-        engines = ['xlrd', 'calamine', 'openpyxl']
-    elif magic[:5] == b'<?xml':
-        kind = "xml"
-        engines = ['openpyxl', 'calamine']
-    elif b'<html' in content_bytes[:500].lower() or b'<table' in content_bytes[:500].lower():
+        kind = "xls"
+    elif (b'<html' in content_bytes[:2000].lower() or
+          b'<table' in content_bytes[:2000].lower() or
+          b'<?xml' in content_bytes[:100]):
         kind = "html"
-        engines = []
     else:
         kind = "unknown"
-        engines = ['openpyxl', 'xlrd', 'calamine']
 
     errors = []
 
-    for engine in engines:
+    # ۱. تلاش Excel
+    if kind in ("xlsx", "xls", "unknown"):
+        if kind == "xls": engines = ['xlrd', 'openpyxl']
+        elif kind == "xlsx": engines = ['openpyxl', 'xlrd']
+        else: engines = ['openpyxl', 'xlrd']
+        for engine in engines:
+            try:
+                return pd.ExcelFile(io.BytesIO(content_bytes), engine=engine), kind, errors
+            except Exception as e:
+                errors.append(f"[excel-{engine}] {str(e)[:120]}")
+
+    # ۲. تلاش HTML
+    if kind in ("html", "unknown"):
+        for flavor in ['html5lib', 'bs4', 'lxml']:
+            try:
+                dfs = pd.read_html(io.BytesIO(content_bytes), flavor=flavor)
+                if dfs:
+                    best = max(dfs, key=lambda d: d.shape[0] * d.shape[1])
+                    if best.shape[0] > 0 and best.shape[1] > 0:
+                        return best, f"html-{flavor}", errors
+            except Exception as e:
+                errors.append(f"[html-{flavor}] {str(e)[:120]}")
+
+    # ۳. تلاش CSV/TSV
+    for enc in ['utf-8', 'utf-8-sig', 'windows-1256', 'latin-1']:
         try:
-            xls = pd.ExcelFile(io.BytesIO(content_bytes), engine=engine)
-            return xls, errors, hex_preview, size, kind
-        except Exception as e:
-            errors.append(f"[{engine}] {str(e)[:180]}")
-
-    # آخرین تلاش: auto-detect
-    if engines:
-        try:
-            xls = pd.ExcelFile(io.BytesIO(content_bytes))
-            return xls, errors, hex_preview, size, kind
-        except Exception as e:
-            errors.append(f"[auto] {str(e)[:180]}")
-
-    return None, errors, hex_preview, size, kind
-
-def try_parse_html(content_bytes):
-    """اگر فایل HTML است، جداول را به DataFrame تبدیل می‌کند."""
-    try:
-        dfs = pd.read_html(io.BytesIO(content_bytes))
-        if dfs:
-            return dfs[0]
-    except Exception:
-        pass
-    return None
-
-def try_parse_csv(content_bytes):
-    """اگر فایل متنی است، به عنوان CSV/TSV تلاش می‌کند."""
-    for encoding in ['utf-8', 'utf-8-sig', 'windows-1256', 'latin-1']:
-        try:
-            text = content_bytes.decode(encoding, errors='ignore')
+            text = content_bytes.decode(enc, errors='ignore')
             for sep in ['\t', ';', ',']:
                 try:
-                    df = pd.read_csv(io.StringIO(text), sep=sep, header=None, on_bad_lines='skip')
+                    df = pd.read_csv(io.StringIO(text), sep=sep, header=None,
+                                     on_bad_lines='skip', engine='python')
                     if df.shape[1] > 1 and df.shape[0] > 2:
-                        return df
+                        return df, f"csv-{enc}", errors
                 except Exception:
                     continue
         except Exception:
             continue
-    return None
+
+    return None, kind, errors
+
+
+# ═══════════════ استخراج ═══════════════
+def extract_excel(file_like, labels):
+    try:
+        if hasattr(file_like, 'getvalue'):
+            content = file_like.getvalue()
+        elif hasattr(file_like, 'read'):
+            file_like.seek(0); content = file_like.read()
+        else:
+            content = file_like
+    except Exception:
+        return {}
+
+    result, kind, errors = parse_any_format(content)
+    if result is None:
+        return {}
+
+    out = {}
+
+    if isinstance(result, pd.ExcelFile):
+        for sh in result.sheet_names:
+            try:
+                raw = pd.read_excel(result, sheet_name=sh, header=None)
+                _extract_from_raw(raw, labels, out)
+            except Exception:
+                continue
+    elif isinstance(result, pd.DataFrame):
+        _extract_from_raw(result, labels, out)
+        # اگر HTML بود، همه جداول را هم بررسی کن
+        if kind.startswith("html"):
+            try:
+                dfs = pd.read_html(io.BytesIO(content))
+                dfs_sorted = sorted(dfs, key=lambda d: d.shape[0] * d.shape[1], reverse=True)
+                for df in dfs_sorted[:10]:
+                    if df.shape[0] >= 2:
+                        _extract_from_raw(df, labels, out)
+            except Exception:
+                pass
+
+    return out
+
+
+def _extract_from_raw(raw, labels, out):
+    if raw is None or raw.empty:
+        return
+
+    # روش ۱: چندستونی
+    if raw.shape[1] >= 2:
+        for hdr in range(min(15, len(raw))):
+            df = raw.iloc[hdr + 1:].reset_index(drop=True)
+            if df.empty or df.shape[1] < 2: continue
+            col_a_norm = df.iloc[:, 0].astype(str).map(norm_label)
+            for k, cands in labels.items():
+                if k in out and not pd.isna(out[k]): continue
+                for cand in cands:
+                    cn = norm_label(cand)
+                    mask = col_a_norm == cn
+                    if not mask.any() and len(cn) >= 4:
+                        mask = col_a_norm.str.contains(re.escape(cn), na=False)
+                    if not mask.any(): continue
+                    row = df[mask].iloc[0]
+                    nums = []
+                    for c in df.columns[1:15]:
+                        v = parse_num(row.get(c))
+                        if not pd.isna(v): nums.append(v)
+                        if len(nums) >= 2: break
+                    if nums:
+                        out[k] = nums[0]
+                        if len(nums) > 1: out[f"{k}_prev"] = nums[1]
+                        break
+
+    # روش ۲: متن‌کاوی (برای ۱-ستونی و HTML چسبیده)
+    missing = [k for k in labels if k not in out or pd.isna(out.get(k))]
+    if not missing: return
+    for idx in range(len(raw)):
+        for col in raw.columns:
+            cell = raw.iloc[idx][col]
+            if pd.isna(cell): continue
+            text = str(cell)
+            if len(text) < 15: continue
+            for k in list(missing):
+                if k in out and not pd.isna(out[k]):
+                    if k in missing: missing.remove(k)
+                    continue
+                for cand in labels[k]:
+                    nums = numbers_after_label(text, cand)
+                    if nums:
+                        out[k] = nums[0]
+                        if len(nums) > 1: out[f"{k}_prev"] = nums[1]
+                        if k in missing: missing.remove(k)
+                        break
+
 
 def numbers_after_label(text, label, max_nums=4):
     if not text or not label: return []
@@ -137,99 +217,6 @@ def numbers_after_label(text, label, max_nums=4):
                 if len(nums) >= max_nums: break
         return nums
 
-# ═══════════════ استخراج اصلی ═══════════════
-def extract_excel(file_like, labels):
-    out = {}
-    try:
-        if hasattr(file_like, 'getvalue'):
-            content = file_like.getvalue()
-        elif hasattr(file_like, 'read'):
-            file_like.seek(0); content = file_like.read()
-        else:
-            content = file_like
-    except Exception:
-        return out
-
-    xls, errors, hex_prev, size, kind = diagnose_file(content)
-
-    # Fallback ۱: HTML
-    if xls is None and kind == "html":
-        df_html = try_parse_html(content)
-        if df_html is not None and not df_html.empty:
-            return _extract_from_df(df_html, labels)
-
-    # Fallback ۲: CSV/TSV
-    if xls is None and kind in ("unknown", "tiny"):
-        df_csv = try_parse_csv(content)
-        if df_csv is not None and not df_csv.empty:
-            return _extract_from_df(df_csv, labels)
-
-    if xls is None:
-        return out
-
-    for sh in xls.sheet_names:
-        try:
-            raw = pd.read_excel(xls, sheet_name=sh, header=None)
-        except Exception:
-            continue
-        if raw.empty: continue
-        _extract_from_raw(raw, labels, out)
-
-    return out
-
-def _extract_from_df(df, labels):
-    """استخراج ساده از یک DataFrame (HTML/CSV)."""
-    out = {}
-    if df.empty: return out
-    _extract_from_raw(df, labels, out)
-    return out
-
-def _extract_from_raw(raw, labels, out):
-    """استخراج از یک sheet خام — هم چندستونی، هم متن‌کاوی."""
-    # روش ۱: چندستونی
-    for hdr in range(min(15, len(raw))):
-        df = raw.iloc[hdr + 1:].reset_index(drop=True)
-        if df.empty or df.shape[1] < 2: continue
-        col_a_norm = df.iloc[:, 0].astype(str).map(norm_label)
-        for k, cands in labels.items():
-            if k in out and not pd.isna(out[k]): continue
-            for cand in cands:
-                cn = norm_label(cand)
-                mask = col_a_norm == cn
-                if not mask.any() and len(cn) >= 4:
-                    mask = col_a_norm.str.contains(re.escape(cn), na=False)
-                if not mask.any(): continue
-                row = df[mask].iloc[0]
-                nums = []
-                for c in df.columns[1:15]:
-                    v = parse_num(row.get(c))
-                    if not pd.isna(v): nums.append(v)
-                    if len(nums) >= 2: break
-                if nums:
-                    out[k] = nums[0]
-                    if len(nums) > 1: out[f"{k}_prev"] = nums[1]
-                    break
-
-    # روش ۲: متن‌کاوی
-    missing = [k for k in labels if k not in out or pd.isna(out.get(k))]
-    if not missing: return
-    for idx in range(len(raw)):
-        for col in raw.columns:
-            cell = raw.iloc[idx][col]
-            if pd.isna(cell): continue
-            text = str(cell)
-            if len(text) < 15: continue
-            for k in list(missing):
-                if k in out and not pd.isna(out[k]):
-                    if k in missing: missing.remove(k)
-                    continue
-                for cand in labels[k]:
-                    nums = numbers_after_label(text, cand)
-                    if nums:
-                        out[k] = nums[0]
-                        if len(nums) > 1: out[f"{k}_prev"] = nums[1]
-                        if k in missing: missing.remove(k)
-                        break
 
 # ═══════════════ برچسب‌ها ═══════════════
 BANK_LABELS = {
@@ -280,11 +267,11 @@ HOLDING_LABELS = {
     "inv_reval":["سود (زیان) تغییر ارزش سرمایه گذاریها"],
     "other_rev":["سایر درآمدها"],
     "rev_total":["جمع درآمدهای عملیاتی"],
-    "salary":["هزینه هاى حقوق، دستمزد و مزایا","هزینه‌های حقوق، دستمزد و مزایا","هزينه ‏هاى حقوق، دستمزد و مزایا"],
+    "salary":["هزینه هاى حقوق، دستمزد و مزایا","هزینه‌های حقوق، دستمزد و مزایا"],
     "other_exp":["سایر هزینه‌ها","ساير هزینه‌ها"],
     "op_exp_total":["جمع هزینه های عملیاتی"],
     "op_profit":["سود (زیان) عملياتى","سود (زیان) عملیاتی"],
-    "fin_cost":["هزینه های مالی","هزینه‌های مالی","هزينه‌ هاى مالى"],
+    "fin_cost":["هزینه های مالی","هزینه‌های مالی"],
     "non_op":["سایر درآمدها و هزینه‌های غیرعملیاتی"],
     "pretax":["سود (زیان) عملیات در حال تداوم قبل از ماليات"],
     "net_income":["سود (زیان) خالص","سود(زیان)خالص","سود (زیان) خالص عملیات در حال تداوم"],
@@ -305,6 +292,7 @@ HOLDING_LABELS = {
     "dps_proposed":["سود سهام پیشنهادی هیئت مدیره"],
     "ni_last_year":["مبلغ سود (زیان) خالص سال مالی گذشته"],
 }
+
 
 # ═══════════════ نسبت‌ها ═══════════════
 def bank_ratios(d, p, sh, m=6):
@@ -403,6 +391,7 @@ def holding_ratios(d, p, sh, m=12):
         "بازده سود نقدی (%)": safe_div(dps, p)*100 if not pd.isna(dps) else np.nan,
     }
 
+
 SECTOR_CONFIG = {
     "holding": {
         "name": "هلدینگ / سرمایه‌گذاری",
@@ -412,36 +401,31 @@ SECTOR_CONFIG = {
         "benchmark": {"P/E":6.0,"P/B":1.0,"ROE (%)":20},
     },
     "bank": {
-        "name": "بانک",
-        "labels": BANK_LABELS, "fn": bank_ratios,
+        "name": "بانک", "labels": BANK_LABELS, "fn": bank_ratios,
         "primary": ["P/B","P/E","ROE سالانه (%)","Cost-to-Income (%)","LDR (%)"],
         "secondary": ["ROA سالانه (%)","پوشش ذخیره (%)","حاشیه سود خالص (%)","Earnings Yield (%)","Market Cap (همت)"],
         "benchmark": {"P/E":5.8,"P/B":1.2,"ROE سالانه (%)":25},
     },
     "petro": {
-        "name": "پتروشیمی",
-        "labels": GENERIC_LABELS, "fn": petro_ratios,
+        "name": "پتروشیمی", "labels": GENERIC_LABELS, "fn": petro_ratios,
         "primary": ["P/E","EV/EBITDA","حاشیه سود ناخالص (%)","ROE (%)","FCF Yield (%)"],
         "secondary": ["P/B","P/S","ROA (%)","Debt/Equity","Interest coverage"],
         "benchmark": {"P/E":6.5,"P/B":1.5,"ROE (%)":20},
     },
     "pharma": {
-        "name": "دارویی",
-        "labels": PHARMA_LABELS, "fn": pharma_ratios,
+        "name": "دارویی", "labels": PHARMA_LABELS, "fn": pharma_ratios,
         "primary": ["P/E","P/B","حاشیه سود ناخالص (%)","R&D / فروش (%)","ROE (%)"],
         "secondary": ["ROA (%)","DSO (روز)","DIO (روز)","CCC (روز)","FCF Yield (%)"],
         "benchmark": {"P/E":8.0,"P/B":2.5,"ROE (%)":25},
     },
     "auto": {
-        "name": "خودرو",
-        "labels": GENERIC_LABELS, "fn": generic_ratios,
+        "name": "خودرو", "labels": GENERIC_LABELS, "fn": generic_ratios,
         "primary": ["P/E","حاشیه سود ناخالص (%)","Debt/Equity","Interest coverage","ROE (%)"],
         "secondary": ["گردش موجودی (بار)","DSO (روز)","FCF Yield (%)","P/B","ROA (%)"],
         "benchmark": {"P/E":5.0,"P/B":1.0},
     },
     "generic": {
-        "name": "عمومی",
-        "labels": GENERIC_LABELS, "fn": generic_ratios,
+        "name": "عمومی", "labels": GENERIC_LABELS, "fn": generic_ratios,
         "primary": ["P/E","P/B","ROE (%)","ROA (%)","حاشیه سود ناخالص (%)"],
         "secondary": ["P/S","Debt/Equity","نسبت جاری","CCC (روز)","FCF Yield (%)"],
         "benchmark": {"P/E":5.5,"P/B":1.3,"ROE (%)":20},
