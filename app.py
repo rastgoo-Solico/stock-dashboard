@@ -139,7 +139,6 @@ st.sidebar.subheader("📊 تعداد سهام (دستی)")
 st.sidebar.caption("⚠️ این عدد را از صورت‌های مالی یا سایت کدال بخوانید")
 st.sidebar.caption("فرمول: سرمایه(م.ریال) ÷ اسمی(ریال) ÷ ۱۰۰۰")
 
-# مقادیر یافت‌شده — فقط اطلاعاتی
 if data:
     with st.sidebar.expander("🔍 مقادیر یافت‌شده در فایل (فقط اطلاع)"):
         cap = data.get("capital", np.nan)
@@ -150,11 +149,10 @@ if data:
             st.write(f"**سرمایه**: {cap:,.0f} م.ریال")
             st.write(f"**اسمی**: {n:,.0f} ریال")
             st.write(f"**محاسبه**: {calc:.2f} میلیارد سهم")
-            st.warning("⚠️ این مقدار ممکن است اشتباه باشد — چند «سرمایه» در فایل هست")
+            st.warning("⚠️ ممکن است اشتباه باشد — چند «سرمایه» در فایل هست")
         else:
             st.caption("سرمایه یافت نشد")
 
-# محاسبه‌گر کمکی
 with st.sidebar.expander("🧮 محاسبه‌گر تعداد سهام"):
     st.caption("اگر نمی‌دانید، اینجا محاسبه کنید")
     cap_in = st.number_input("سرمایه (میلیون ریال)", min_value=0.0,
@@ -183,11 +181,10 @@ shares = st.sidebar.number_input(
 # ═══════════════ قیمت — دستی ═══════════════
 st.sidebar.divider()
 st.sidebar.subheader("💰 قیمت سهم (دستی)")
-st.sidebar.caption("آخرین قیمت معامله در بازار")
+st.sidebar.caption("آخرین قیمت معامله در بازار (به تومان)")
 
 months = st.sidebar.selectbox("دوره صورت مالی (ماه)", [3, 6, 9, 12], index=3)
 
-# پیشنهاد قیمت — فقط اطلاعاتی
 if data:
     with st.sidebar.expander("💡 قیمت پیشنهادی (فقط اطلاع)"):
         temp_r = cfg["fn"](data, p=1.0, sh=shares*1e9, m=months)
@@ -219,28 +216,34 @@ warnings = health_check(ratios, price, shares, data)
 st.title(f"📊 داشبورد تحلیل — {cfg['name']}")
 st.caption(f"قیمت: **{price:,.0f} تومان** | سهام: **{shares:.2f} میلیارد** | دوره: **{months} ماه** | فایل‌ها: **{len(uploaded) if uploaded else 0}**")
 
-# هشدارهای سلامت — بالا، برجسته
+# هشدارهای سلامت
 if warnings:
     st.markdown("### ⚠️ بررسی سلامت داده")
     for w in warnings:
         st.markdown(f"<div class='bad-box'>{w}</div>", unsafe_allow_html=True)
 
-# اطلاعات شفاف
+# اطلاعات شفاف — بدون باگ
 if uploaded:
     st.markdown("### 🔍 اطلاعات محاسبه")
     c1, c2, c3, c4 = st.columns(4)
-    cap = data.get("capital", np.nan)
-    nom = data.get("nominal_value", np.nan)
-    if pd.isna(nom) or nom <= 0: nom = 1000
+    eps_val = ratios.get("EPS سالانه (ریال)")
+    bvps_val = ratios.get("BVPS (ریال)")
+    pe_val = ratios.get("P/E")
+    pb_val = ratios.get("P/B")
+    mcap_val = ratios.get("Market Cap (همت)")
+    
     c1.metric("تعداد سهام (دستی)", fmt(shares, dec=2) + " م.سهم")
     c2.metric("قیمت (دستی)", fmt(price, dec=0) + " تومان")
-    c3.metric("EPS سالانه", fmt(ratios.get("EPS سالانه (ریال)"), dec=0) + " ریال")
-    c4.metric("Market Cap", fmt(ratios.get("Market Cap (همت)"), dec=0) + " همت")
+    c3.metric("EPS سالانه", fmt(eps_val, dec=0) + " ریال")
+    c4.metric("Market Cap", fmt(mcap_val, dec=0) + " همت")
+    
     st.caption(
-        f"📐 فرمول P/E = قیمت(ریال) ÷ EPS = {price*10:,.0f} ÷ {fmt(ratios.get('EPS سالانه (ریال)', dec=0))} = "
-        f"**{fmt(ratios.get('P/E'), dec=2)}**  •  "
-        f"P/B = قیمت(ریال) ÷ BVPS = {price*10:,.0f} ÷ {fmt(ratios.get('BVPS (ریال)', dec=0))} = "
-        f"**{fmt(ratios.get('P/B'), dec=2)}**"
+        f"📐 **P/E** = قیمت(ریال) ÷ EPS = {price*10:,.0f} ÷ {fmt(eps_val, dec=0)} = "
+        f"**{fmt(pe_val, dec=2)}**"
+    )
+    st.caption(
+        f"📐 **P/B** = قیمت(ریال) ÷ BVPS = {price*10:,.0f} ÷ {fmt(bvps_val, dec=0)} = "
+        f"**{fmt(pb_val, dec=2)}**"
     )
 
 # پوشش
