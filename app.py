@@ -1,11 +1,11 @@
-"""app.py — داشبورد چند-صنعتی تحلیل سهام با پارس چند-Engine"""
+"""app.py — داشبورد چند-صنعتی تحلیل سهام"""
 import io
 import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-from core import SECTOR_CONFIG, extract_excel, read_excel_safe, to_en
+from core import SECTOR_CONFIG, extract_excel, read_excel_safe
 
 st.set_page_config(page_title="داشبورد تحلیل سهام", page_icon="📊",
                    layout="wide", initial_sidebar_state="expanded")
@@ -30,10 +30,17 @@ h1,h2,h3 { color:#0f172a; }
 </style>
 """, unsafe_allow_html=True)
 
-# ═══════════════════ کمک‌تابع‌ها ═══════════════════
+# ═══════════════════ توابع کمکی (همه بالای فایل) ═══════════════════
 def fmt(v, pct=False, dec=1, suffix=""):
     if v is None or pd.isna(v): return "—"
     return f"{v:,.{dec}f}٪{suffix}" if pct else f"{v:,.{dec}f}{suffix}"
+
+def safe_pct(a, b):
+    try:
+        if b in (0, None) or pd.isna(a) or pd.isna(b): return np.nan
+        return a / b * 100
+    except Exception:
+        return np.nan
 
 GLOSSARY = [
     ("P/E","نسبت قیمت به سود هر سهم. زیر ۵ = ارزان، بالای ۱۰ = گران"),
@@ -65,8 +72,7 @@ GLOSSARY = [
 # ═══════════════════ سایدبار ═══════════════════
 st.sidebar.header("⚙️ تنظیمات")
 sk = st.sidebar.selectbox("صنعت", list(SECTOR_CONFIG.keys()),
-                          format_func=lambda k: SECTOR_CONFIG[k]["name"],
-                          index=0)
+                          format_func=lambda k: SECTOR_CONFIG[k]["name"], index=0)
 cfg = SECTOR_CONFIG[sk]
 
 uploaded = st.sidebar.file_uploader(
@@ -85,39 +91,49 @@ dollar = st.sidebar.number_input("نرخ دلار (ریال) — اختیاری"
 # ═══════════════════ پارس چند فایل ═══════════════════
 data = {}
 file_report = []
+previews = {}
 
 if uploaded:
     with st.spinner(f"در حال پارس {len(uploaded)} فایل..."):
         for f in uploaded:
-            # خواندن بایت‌ها
             try:
                 content = f.getvalue()
             except Exception:
-                f.seek(0)
-                content = f.read()
+                try:
+                    f.seek(0); content = f.read()
+                except Exception as e:
+                    file_report.append((f.name, 0, len(cfg["labels"]), f"❌ خواندن شکست: {e}", 0, "?"))
+                    continue
 
-            # تشخیص ساختار
+            magic = content[:4] if len(content) >= 4 else b''
+            magic_str = magic.hex() if magic else "?"
+
             xls = read_excel_safe(content)
             if xls is None:
-                file_report.append((f.name, 0, len(cfg["labels"]), "❌ قابل خواندن نبود", 0))
+                file_report.append((f.name, 0, len(cfg["labels"]), f"❌ Excel-file نشد (magic: {magic_str})", 0, magic_str))
                 continue
 
             ncols = 0
+            sheet_names = xls.sheet_names
             try:
-                sample = pd.read_excel(xls, sheet_name=xls.sheet_names[0], header=None, nrows=30)
+                sample = pd.read_excel(xls, sheet_name=sheet_names[0], header=None, nrows=30)
                 ncols = sample.shape[1]
-            except Exception:
-                pass
+                previews[f.name] = sample
+            except Exception as e:
+                previews[f.name] = f"خطا: {e}"
 
             structure = "چندستونی" if ncols > 3 else "تک‌ستونی"
 
-            # استخراج
-            extracted = extract_excel(io.BytesIO(content), cfg["labels"])
+            try:
+                extracted = extract_excel(io.BytesIO(content), cfg["labels"])
+            except Exception as e:
+                file_report.append((f.name, 0, len(cfg["labels"]), f"❌ پارس شکست: {e}", ncols, magic_str))
+                continue
+
             found = len([k for k, v in extracted.items() if not pd.isna(v)])
             total_fields = len(cfg["labels"])
-            file_report.append((f.name, found, total_fields, f"{structure} ({ncols} ستون)", ncols))
+            file_report.append((f.name, found, total_fields, f"{structure} ({ncols} ستون، {len(sheet_names)} شیت)", ncols, magic_str))
 
-            # ادغام — فایل‌های بعدی فقط فیلدهای گم‌شده را پر می‌کنند
             for k, v in extracted.items():
                 if k not in data or pd.isna(data.get(k)):
                     data[k] = v
@@ -126,9 +142,9 @@ if uploaded:
 if uploaded and len([k for k, v in data.items() if not pd.isna(v)]) == 0:
     st.markdown(
         f"<div class='bad-box'>🔴 <b>هیچ داده‌ای از {len(uploaded)} فایل استخراج نشد.</b><br>"
-        f"۱) در تب «📋 گزارش پارس» ببینید کدام فایل خوانده شد.<br>"
-        f"۲) صنعت انتخابی «{cfg['name']}» را با ساختار فایل تطبیق دهید.<br>"
-        f"۳) در تب «🔧 داده» فیلدهای گم را دستی وارد کنید.</div>",
+        f"۱) در «📋 گزارش پارس» و «🔬 نمای خام» ببینید فایل خوانده شد یا نه<br>"
+        f"۲) صنعت انتخابی «{cfg['name']}» را با ساختار فایل تطبیق دهید<br>"
+        f"۳) در تب «🔧 داده» فیلدهای گم را دستی وارد کنید</div>",
         unsafe_allow_html=True
     )
 
@@ -139,15 +155,28 @@ ratios = cfg["fn"](data, p=price * 10, sh=shares * 1e9, m=months)
 st.title(f"📊 داشبورد تحلیل — {cfg['name']}")
 st.caption(f"قیمت: **{price:,.0f} تومان** | سهام: **{shares:.2f} میلیارد** | دوره: **{months} ماه** | دلار: **{dollar:,.0f} ریال** | فایل‌ها: **{len(uploaded) if uploaded else 0}**")
 
-# گزارش هر فایل
+# گزارش هر فایل + Debug
 if file_report:
     with st.expander("📋 گزارش پارس هر فایل", expanded=True):
-        for fname, found, total, note, ncols in file_report:
+        for row in file_report:
+            fname, found, total, note = row[0], row[1], row[2], row[3]
             pct = int(found / total * 100) if total else 0
             icon = "🟢" if pct >= 40 else ("🟡" if pct >= 10 else "🔴")
             st.write(f"{icon} **{fname}** — {found}/{total} ({pct}٪) — `{note}`")
 
-# نوار پوشش کل
+    with st.expander("🔬 نمای خام فایل (Debug)", expanded=False):
+        for fname, *_ in file_report:
+            st.markdown(f"### `{fname}`")
+            pv = previews.get(fname)
+            if isinstance(pv, pd.DataFrame):
+                st.write(f"**ابعاد**: {pv.shape[0]} سطر × {pv.shape[1]} ستون")
+                st.dataframe(pv.head(40), use_container_width=True, height=350)
+            elif isinstance(pv, str):
+                st.error(pv)
+            else:
+                st.caption("پیش‌نمایش موجود نیست")
+
+# نوار پوشش
 req = [k for k in cfg["labels"] if not k.endswith("_prev")]
 found_all = [k for k in req if not pd.isna(data.get(k))]
 miss = [k for k in req if pd.isna(data.get(k))]
@@ -156,9 +185,8 @@ c1, c2 = st.columns([3, 1])
 c1.progress(cov, text=f"پوشش کل: {len(found_all)}/{len(req)} ({cov}٪)")
 c2.caption("⚠️ فیلد گم — تب «داده»" if miss else "✅ کامل")
 
-# هشدار زیان
 if not pd.isna(data.get("net_income")) and data.get("net_income", 0) < 0:
-    st.markdown("<div class='bad-box'>🔴 شرکت زیان‌ده است — P/E معنا ندارد.</div>", unsafe_allow_html=True)
+    st.markdown("<div class='bad-box'>🔴 شرکت زیان‌ده است.</div>", unsafe_allow_html=True)
 
 # ═══════════════════ تب‌ها ═══════════════════
 T = st.tabs(["🏠 خلاصه", "📈 سود و زیان", "🏦 ترازنامه", "💰 ارزش‌گذاری",
@@ -188,8 +216,7 @@ with T[0]:
         flags.append("🟡 نسبت هزینه به درآمد بالا")
     if flags:
         st.subheader("🚩 پرچم‌های تحلیلی")
-        for f in flags:
-            st.write(f)
+        for f in flags: st.write(f)
 
 # ─── تب ۲: سود و زیان ───
 with T[1]:
@@ -212,7 +239,7 @@ with T[1]:
         pv = abs(data.get("provision", 0)) / 1e3
         oth = ni - (oi - dc - ac - pv)
         x = ["درآمد عملیاتی", "هزینه سود سپرده", "هزینه اداری",
-             "ذخیره مطالبات", "سایر اقلام", "سود خالص"]
+             "ذخیره مطالبات", "سایر", "سود خالص"]
         y = [oi, -dc, -ac, -pv, oth, ni]
         meas = ["relative"] * 5 + ["total"]
     else:
@@ -238,7 +265,6 @@ with T[1]:
     fig.update_layout(height=440, showlegend=False, yaxis_title="همت",
                       title="پل سود (همت) — «سایر» = اقلام باقی‌مانده تا تطبیق")
     st.plotly_chart(fig, use_container_width=True)
-    st.caption("💡 اگر «سایر اقلام» بزرگ باشد، سود از فعالیت اصلی نمی‌آید — پرچم کیفیت سود.")
 
 # ─── تب ۳: ترازنامه ───
 with T[2]:
@@ -249,7 +275,6 @@ with T[2]:
 
     if sk == "holding":
         li = data.get("long_inv", 0) / 1e3
-        si = data.get("short_inv", 0) / 1e3
         asc = data.get("associates", 0) / 1e3
         labels = ["نقد", "سرمایه‌گذاری بلندمدت", "شرکت‌های وابسته", "سایر"]
         vals = [cash, li, asc, max(0, ta - cash - li - asc)]
@@ -326,13 +351,12 @@ with T[3]:
 # ─── تب ۵: تحلیل سهامدار ───
 with T[4]:
     st.header("👤 تحلیل از دید سهامدار")
-    st.caption("این تحلیل مبتنی بر داده‌های تاریخی و مفروضات است — **توصیه سرمایه‌گذاری نیست**.")
+    st.caption("تحلیلی است — توصیه سرمایه‌گذاری نیست.")
 
     eps_a = ratios.get("EPS سالانه (ریال)", np.nan)
     bvps = ratios.get("BVPS (ریال)", np.nan)
     dps = ratios.get("DPS (ریال)", np.nan)
     div_yield = ratios.get("بازده سود نقدی (%)", 0)
-    price_rial = price * 10
 
     st.subheader("💵 سود نقدی و بازده سهامدار")
     c1, c2, c3, c4 = st.columns(4)
@@ -342,11 +366,10 @@ with T[4]:
     c4.metric("بازده نقدی", fmt(div_yield, pct=True))
 
     if not pd.isna(div_yield) and div_yield < 2:
-        st.markdown("<div class='warn-box'>⚠️ بازده سود نقدی زیر ۲٪ — بازده اصلی سهامدار فقط از رشد قیمت است.</div>", unsafe_allow_html=True)
+        st.markdown("<div class='warn-box'>⚠️ بازده سود نقدی زیر ۲٪ — بازده اصلی از رشد قیمت است.</div>", unsafe_allow_html=True)
     elif not pd.isna(div_yield) and div_yield > 5:
         st.markdown("<div class='good-box'>✅ بازده سود نقدی بالای ۵٪ — جریان نقدی مناسب.</div>", unsafe_allow_html=True)
 
-    # قیمت هدف
     st.subheader("🎯 قیمت هدف (سه روش)")
     peer_pe = cfg["benchmark"].get("P/E", 6.0)
     peer_pb = cfg["benchmark"].get("P/B", 1.2)
@@ -365,18 +388,16 @@ with T[4]:
         c4.metric("میانگین هدف", f"{target:,.0f} ت",
                   delta=f"{up:+.1f}%", delta_color="normal" if up > 0 else "inverse")
 
-    # TSR
     if not pd.isna(target):
         cap_gain = (target - price) / price * 100
         tsr = cap_gain + (div_yield or 0)
-        st.subheader("💎 بازده کل ۱ساله سهامدار (TSR)")
+        st.subheader("💎 TSR ۱ساله")
         c1, c2, c3 = st.columns(3)
         c1.metric("سود سرمایه", f"{cap_gain:+.1f}%")
         c2.metric("سود نقدی", f"{div_yield or 0:+.1f}%")
         c3.metric("TSR کل", f"{tsr:+.1f}%",
                   delta_color="normal" if tsr > 0 else "inverse")
 
-    # سناریوها
     st.subheader("🔮 سناریوهای ۱۲ماهه")
     eps_prev = data.get("eps_prev", np.nan)
     if eps_prev and not pd.isna(eps_prev) and eps_prev > 0 and eps_a and not pd.isna(eps_a):
@@ -391,29 +412,23 @@ with T[4]:
         tp = en * pe_t / 10 if en and not pd.isna(en) else np.nan
         ret = (tp - price) / price * 100 + (div_yield or 0) if tp and not pd.isna(tp) else np.nan
         scen.append({
-            "سناریو": nm,
-            "رشد EPS%": round(eps_g * gf, 1),
-            "P/E هدف": round(pe_t, 1),
-            "EPS جدید (ریال)": en,
-            "قیمت هدف (تومان)": tp,
-            "TSR%": ret,
+            "سناریو": nm, "رشد EPS%": round(eps_g * gf, 1),
+            "P/E هدف": round(pe_t, 1), "EPS جدید": en,
+            "قیمت هدف (تومان)": tp, "TSR%": ret,
         })
     df_scen = pd.DataFrame(scen)
     st.dataframe(df_scen, use_container_width=True, hide_index=True)
 
-    # نمودار سناریو
     df_plot = df_scen.dropna(subset=["قیمت هدف (تومان)"])
     if not df_plot.empty:
         fig = px.bar(df_plot, x="سناریو", y="قیمت هدف (تومان)", color="سناریو",
-                     text_auto=".0f",
-                     color_discrete_sequence=["#16a34a", "#2563eb", "#dc2626"])
+                     text_auto=".0f", color_discrete_sequence=["#16a34a", "#2563eb", "#dc2626"])
         fig.add_hline(y=price, line_dash="dash", line_color="gray",
-                      annotation_text=f"قیمت فعلی {price:.0f}")
+                      annotation_text=f"قیمت {price:.0f}")
         fig.update_layout(height=380, showlegend=False)
         st.plotly_chart(fig, use_container_width=True)
 
-    # چشم‌انداز ۳ساله
-    st.subheader("📅 چشم‌انداز ۳ساله (اگر روند فعلی ادامه یابد)")
+    st.subheader("📅 چشم‌انداز ۳ساله")
     if eps_a and not pd.isna(eps_a) and eps_a > 0:
         eps_3y = eps_a * (1 + eps_g / 100) ** 3
         tp_3y = eps_3y * peer_pe / 10
@@ -422,67 +437,47 @@ with T[4]:
         tsr_3y = cap_3y + div_3y
         c1, c2, c3 = st.columns(3)
         c1.metric("EPS سال ۳", fmt(eps_3y, dec=0) + " ریال")
-        c2.metric("قیمت هدف سال ۳", fmt(tp_3y, dec=0) + " تومان")
+        c2.metric("قیمت هدف سال ۳", fmt(tp_3y, dec=0) + " ت")
         c3.metric("TSR تجمعی ۳ساله", f"{tsr_3y:+.1f}%",
                   delta_color="normal" if tsr_3y > 0 else "inverse")
-        if tp_3y > 0 and price > 0:
-            total_ret = (tp_3y - price + sum([div_yield * price / 100] * 3)) / price
-            cagr = (1 + total_ret) ** (1/3) - 1
-            st.caption(f"معادل بازده مرکب سالانه: **{cagr*100:.1f}%** — با نرخ سود بانکی و تورم مقایسه کنید.")
 
-    # ریسک‌ها
-    st.subheader("⚠️ ریسک‌های کلیدی سهامدار")
+    st.subheader("⚠️ ریسک‌های کلیدی")
     risks = []
     if not pd.isna(div_yield) and div_yield < 2:
         risks.append("🔴 سود نقدی ناچیز — بازده فقط از رشد قیمت")
     if ratios.get("Debt/Equity", 0) > 2:
         risks.append("🟡 اهرم بالا (Debt/Equity بالای ۲)")
     if not pd.isna(ratios.get("P/E")) and ratios.get("P/E", 0) > 10:
-        risks.append("🟡 P/E بالا — احتمال گران بودن")
-    if ratios.get("Cost-to-Income (%)", 0) > 45:
-        risks.append("🟡 نسبت هزینه به درآمد بالا")
+        risks.append("🟡 P/E بالا")
     if not risks:
-        risks.append("✅ ریسک قابل‌توجهی از داده‌ها شناسایی نشد")
-    for r in risks:
-        st.write(r)
+        risks.append("✅ ریسک خاصی شناسایی نشد")
+    for r in risks: st.write(r)
 
-    # جمع‌بندی
-    st.subheader("📋 جمع‌بندی تحلیلی")
+    st.subheader("📋 جمع‌بندی")
     score = 0
     if not pd.isna(target):
-        if target > price * 1.2:
-            score += 2
-        elif target > price:
-            score += 1
-    if not pd.isna(ratios.get("P/E")) and ratios.get("P/E") < 5:
-        score += 1
-    if ratios.get("ROE (%)", ratios.get("ROE سالانه (%)", 0)) > 20:
-        score += 1
-    if (div_yield or 0) > 3:
-        score += 1
+        if target > price * 1.2: score += 2
+        elif target > price: score += 1
+    if not pd.isna(ratios.get("P/E")) and ratios.get("P/E") < 5: score += 1
+    if ratios.get("ROE (%)", ratios.get("ROE سالانه (%)", 0)) > 20: score += 1
+    if (div_yield or 0) > 3: score += 1
 
-    if score >= 4:
-        v, c = "🟢 جذاب برای بررسی بیشتر", "good-box"
-    elif score >= 2:
-        v, c = "🟡 نیازمند بررسی دقیق‌تر", "warn-box"
-    else:
-        v, c = "🔴 پرریسک", "bad-box"
-    st.markdown(f"<div class='{c}'><b>سیگنال تحلیلی (نه توصیه):</b> {v} — امتیاز {score}/6</div>",
-                unsafe_allow_html=True)
-    st.caption("⚠️ این تحلیل خودکار است و جایگزین مشاوره سرمایه‌گذاری حرفه‌ای نیست.")
+    if score >= 4: v, c = "🟢 جذاب", "good-box"
+    elif score >= 2: v, c = "🟡 نیازمند بررسی", "warn-box"
+    else: v, c = "🔴 پرریسک", "bad-box"
+    st.markdown(f"<div class='{c}'><b>سیگنال (نه توصیه):</b> {v} — {score}/6</div>", unsafe_allow_html=True)
 
 # ─── تب ۶: داده ───
 with T[5]:
     st.subheader("✏️ داده استخراج‌شده — قابل ویرایش")
-    st.caption("مقادیر یافت‌شده را اصلاح کنید یا فیلدهای گم را پر کنید. واحد: میلیون ریال")
+    st.caption("مقادیر یافت‌شده را اصلاح یا فیلدهای گم را پر کنید. واحد: میلیون ریال")
 
     rows = []
     for k, cands in cfg["labels"].items():
         cur = data.get(k, np.nan)
         prev = data.get(f"{k}_prev", np.nan)
         rows.append({
-            "کلید": k,
-            "شرح": cands[0],
+            "کلید": k, "شرح": cands[0],
             "دوره جاری": None if pd.isna(cur) else float(cur),
             "دوره قبل": None if pd.isna(prev) else float(prev),
         })
@@ -501,11 +496,9 @@ with T[5]:
     if st.button("✅ اعمال تغییرات"):
         for _, row in edited.iterrows():
             k = row["کلید"]
-            if pd.notna(row["دوره جاری"]):
-                data[k] = float(row["دوره جاری"])
-            if pd.notna(row["دوره قبل"]):
-                data[f"{k}_prev"] = float(row["دوره قبل"])
-        st.success("تغییرات اعمال شد — داده‌ها به‌روز شد")
+            if pd.notna(row["دوره جاری"]): data[k] = float(row["دوره جاری"])
+            if pd.notna(row["دوره قبل"]): data[f"{k}_prev"] = float(row["دوره قبل"])
+        st.success("اعمال شد — صفحه reload می‌شود")
         st.rerun()
 
     st.divider()
@@ -514,13 +507,10 @@ with T[5]:
                          for k, v in ratios.items()])
     st.dataframe(df_r, use_container_width=True, height=400)
 
-    st.download_button(
-        "⬇️ دانلود CSV نسبت‌ها",
-        df_r.to_csv(index=False).encode("utf-8-sig"),
-        f"ratios_{sk}.csv", "text/csv"
-    )
+    st.download_button("⬇️ دانلود CSV",
+                       df_r.to_csv(index=False).encode("utf-8-sig"),
+                       f"ratios_{sk}.csv", "text/csv")
 
-    # لیست فیلدهای گم‌شده
     if miss:
         st.subheader("⚠️ فیلدهای گم‌شده")
         for m in miss:
@@ -528,26 +518,13 @@ with T[5]:
 
 # ─── تب ۷: واژه‌نامه ───
 with T[6]:
-    st.header("📖 واژه‌نامه اصطلاحات")
-    st.caption("همه اصطلاحات انگلیسی به‌کاررفته در داشبورد با توضیح فارسی.")
+    st.header("📖 واژه‌نامه")
     for en, fa in GLOSSARY:
         st.markdown(f"**{en}** — {fa}")
 
-# واژه‌نامه پایین صفحه
 st.divider()
-with st.expander("📖 راهنمای سریع اصطلاحات (کلیک کنید)", expanded=False):
+with st.expander("📖 راهنمای سریع اصطلاحات", expanded=False):
     for en, fa in GLOSSARY:
         st.markdown(f"**{en}**: {fa}")
 
-st.caption("⚠️ این ابزار تحلیلی است و توصیه سرمایه‌گذاری نیست. ارقام ممکن است حسابرسی‌نشده باشند.")
-
-
-# ═══════════════════ تابع کمکی ═══════════════════
-def safe_pct(a, b):
-    """درصد ایمن — برای نوار تب ترازنامه."""
-    try:
-        if b in (0, None) or pd.isna(a) or pd.isna(b):
-            return np.nan
-        return a / b * 100
-    except Exception:
-        return np.nan
+st.caption("⚠️ ابزار تحلیلی است — توصیه سرمایه‌گذاری نیست.")
