@@ -370,4 +370,92 @@ def generic_ratios(d, p, sh, m=6):
         "حاشیه سود عملیاتی (%)": safe_div(d.get("op_profit", np.nan), rev)*100,
         "حاشیه سود خالص (%)": safe_div(ni, rev)*100,
         "ROE (%)": safe_div(ni_a, eq)*100, "ROA (%)": safe_div(ni_a, ta)*100,
-        "نسبت جاری": safe_div(ca, cl), "Debt/Equity":
+        "نسبت جاری": safe_div(ca, cl), "Debt/Equity": safe_div(debt, eq),
+        "Interest coverage": safe_div(d.get("op_profit", np.nan), abs(d["fin_cost"]) if not pd.isna(d.get("fin_cost", np.nan)) else np.nan),
+        "گردش موجودی (بار)": safe_div(cogs*f, inv),
+        "DSO (روز)": dso, "DIO (روز)": dio, "DPO (روز)": dpo, "CCC (روز)": ccc,
+        "FCF Yield (%)": safe_div((cfo*f - abs(capex*f))*1e6, mcap)*100,
+        "EPS سالانه (ریال)": eps_a, "BVPS (ریال)": bvps,
+        "P/E": safe_div(p, eps_a) if eps_a and eps_a > 0 else np.nan,
+        "P/B": safe_div(p, bvps), "P/S": safe_div(mcap, rev*f*1e6),
+        "Market Cap (همت)": safe_div(mcap, 1e12),
+    }
+
+def petro_ratios(d, p, sh, m=6):
+    r = generic_ratios(d, p, sh, m); f = 12/m
+    op = d.get("op_profit", np.nan); rev = d.get("revenue", np.nan)
+    ebitda = safe_add(op, safe_mul(rev, 0.05)) if not pd.isna(op) else np.nan
+    net_debt = safe_add(d.get("total_debt", 0) or 0, -(d.get("cash", 0) or 0))
+    mcap = p*sh; ev = safe_add(mcap, net_debt*1e6)
+    r["EV/EBITDA"] = safe_div(ev, ebitda*f*1e6)
+    return r
+
+def pharma_ratios(d, p, sh, m=6):
+    r = generic_ratios(d, p, sh, m)
+    r["R&D / فروش (%)"] = safe_div(d.get("rd", np.nan), d.get("revenue", np.nan))*100
+    return r
+
+def holding_ratios(d, p, sh, m=12):
+    f = 12/m; ni = d.get("net_income", np.nan); ni_a = ni*f if not pd.isna(ni) else np.nan
+    eq = d.get("equity", np.nan); ta = d.get("total_assets", np.nan)
+    eps_a = _compute_eps(d, ni_a, sh, f, m)
+    bvps = safe_div(eq*1e6, sh); mcap = p*sh
+    long_inv = d.get("long_inv", np.nan); assoc = d.get("associates", np.nan); short_inv = d.get("short_inv", np.nan)
+    total_inv = safe_add(*[v for v in [long_inv, assoc, short_inv] if not pd.isna(v)])
+    div_inc = d.get("div_income", np.nan); rev_tot = d.get("rev_total", np.nan)
+    dps = np.nan
+    if d.get("dps_approved") and d.get("capital"):
+        dps = d["dps_approved"]*1e6/(d["capital"]*1e3)
+    return {
+        "EPS سالانه (ریال)": eps_a, "BVPS (ریال)": bvps,
+        "ROE (%)": safe_div(ni_a, eq)*100, "ROA (%)": safe_div(ni_a, ta)*100,
+        "حاشیه سود خالص (%)": safe_div(ni, rev_tot)*100,
+        "سهم سود سهام از درآمد (%)": safe_div(div_inc, rev_tot)*100,
+        "درصد سرمایه‌گذاری از دارایی (%)": safe_div(total_inv, ta)*100,
+        "نسبت جاری": safe_div(d.get("current_assets", np.nan), d.get("current_liab", np.nan)),
+        "Debt/Equity": safe_div(d.get("total_liab", np.nan), eq),
+        "P/E": safe_div(p, eps_a) if eps_a and eps_a > 0 else np.nan,
+        "P/B": safe_div(p, bvps), "P/NAV (تخمینی)": safe_div(p, bvps),
+        "Market Cap (همت)": safe_div(mcap, 1e12),
+        "DPS (ریال)": dps,
+        "بازده سود نقدی (%)": safe_div(dps, p)*100 if not pd.isna(dps) else np.nan,
+    }
+
+SECTOR_CONFIG = {
+    "holding": {
+        "name": "هلدینگ / سرمایه‌گذاری", "labels": HOLDING_LABELS, "fn": holding_ratios,
+        "primary": ["P/E","P/B","P/NAV (تخمینی)","ROE (%)","حاشیه سود خالص (%)"],
+        "secondary": ["EPS سالانه (ریال)","BVPS (ریال)","ROA (%)","Debt/Equity","بازده سود نقدی (%)"],
+        "benchmark": {"P/E":6.0,"P/B":1.0,"ROE (%)":20},
+    },
+    "bank": {
+        "name": "بانک", "labels": BANK_LABELS, "fn": bank_ratios,
+        "primary": ["P/B","P/E","ROE سالانه (%)","Cost-to-Income (%)","LDR (%)"],
+        "secondary": ["ROA سالانه (%)","پوشش ذخیره (%)","حاشیه سود خالص (%)","Earnings Yield (%)","Market Cap (همت)"],
+        "benchmark": {"P/E":5.8,"P/B":1.2,"ROE سالانه (%)":25},
+    },
+    "petro": {
+        "name": "پتروشیمی", "labels": GENERIC_LABELS, "fn": petro_ratios,
+        "primary": ["P/E","EV/EBITDA","حاشیه سود ناخالص (%)","ROE (%)","FCF Yield (%)"],
+        "secondary": ["P/B","P/S","ROA (%)","Debt/Equity","Interest coverage"],
+        "benchmark": {"P/E":6.5,"P/B":1.5,"ROE (%)":20},
+    },
+    "pharma": {
+        "name": "دارویی", "labels": PHARMA_LABELS, "fn": pharma_ratios,
+        "primary": ["P/E","P/B","حاشیه سود ناخالص (%)","R&D / فروش (%)","ROE (%)"],
+        "secondary": ["ROA (%)","DSO (روز)","DIO (روز)","CCC (روز)","FCF Yield (%)"],
+        "benchmark": {"P/E":8.0,"P/B":2.5,"ROE (%)":25},
+    },
+    "auto": {
+        "name": "خودرو", "labels": GENERIC_LABELS, "fn": generic_ratios,
+        "primary": ["P/E","حاشیه سود ناخالص (%)","Debt/Equity","Interest coverage","ROE (%)"],
+        "secondary": ["گردش موجودی (بار)","DSO (روز)","FCF Yield (%)","P/B","ROA (%)"],
+        "benchmark": {"P/E":5.0,"P/B":1.0},
+    },
+    "generic": {
+        "name": "عمومی", "labels": GENERIC_LABELS, "fn": generic_ratios,
+        "primary": ["P/E","P/B","ROE (%)","ROA (%)","حاشیه سود ناخالص (%)"],
+        "secondary": ["P/S","Debt/Equity","نسبت جاری","CCC (روز)","FCF Yield (%)"],
+        "benchmark": {"P/E":5.5,"P/B":1.3,"ROE (%)":20},
+    },
+}
