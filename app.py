@@ -1,4 +1,4 @@
-"""app.py — داشبورد تحلیل سهام با استخراج خودکار تعداد سهام + پیشنهاد قیمت"""
+"""app.py — ورود دستی تعداد سهام و قیمت (بدون محاسبه خودکار)"""
 import io
 import pandas as pd
 import numpy as np
@@ -6,7 +6,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 from core import (SECTOR_CONFIG, extract_excel, parse_any_format,
-                  estimate_shares_bn, suggest_price_toman)
+                  suggest_price_toman, health_check)
 
 st.set_page_config(page_title="داشبورد تحلیل سهام", page_icon="📊",
                    layout="wide", initial_sidebar_state="expanded")
@@ -40,45 +40,44 @@ def safe_pct(a, b):
     try:
         if b in (0, None) or pd.isna(a) or pd.isna(b): return np.nan
         return a / b * 100
-    except Exception:
-        return np.nan
+    except: return np.nan
+
+def merge_prefer_larger(target, source):
+    """ادغام — مقدار با قدرمطلق بزرگ‌تر (سالانه > فصلی) برنده می‌شود."""
+    for k, v in source.items():
+        if v is None or pd.isna(v): continue
+        if k not in target or pd.isna(target.get(k)):
+            target[k] = v
+        else:
+            try:
+                if abs(float(v)) > abs(float(target.get(k))):
+                    target[k] = v
+            except (ValueError, TypeError):
+                pass
 
 GLOSSARY = [
-    ("P/E","قیمت به سود هر سهم"),
-    ("P/B","قیمت به ارزش دفتری"),
-    ("P/NAV","قیمت به خالص ارزش دارایی‌ها"),
-    ("ROA","سود خالص ÷ کل دارایی"),
-    ("ROE","سود خالص ÷ حقوق مالکانه"),
-    ("EPS","سود هر سهم"),
-    ("BVPS","ارزش دفتری هر سهم"),
-    ("DPS","سود نقدی هر سهم"),
-    ("Dividend Yield","DPS ÷ قیمت"),
-    ("Payout Ratio","DPS ÷ EPS"),
-    ("LDR","تسهیلات ÷ سپرده (بانک)"),
-    ("NPL","مطالبات غیرجاری"),
+    ("P/E","قیمت به سود هر سهم"), ("P/B","قیمت به ارزش دفتری"),
+    ("P/NAV","قیمت به خالص ارزش دارایی‌ها"), ("ROA","سود خالص ÷ کل دارایی"),
+    ("ROE","سود خالص ÷ حقوق مالکانه"), ("EPS","سود هر سهم"),
+    ("BVPS","ارزش دفتری هر سهم"), ("DPS","سود نقدی هر سهم"),
+    ("Dividend Yield","DPS ÷ قیمت"), ("Payout Ratio","DPS ÷ EPS"),
+    ("LDR","تسهیلات ÷ سپرده (بانک)"), ("NPL","مطالبات غیرجاری"),
     ("Cost-to-Income","هزینه ÷ درآمد عملیاتی"),
     ("EBITDA","سود قبل از بهره، مالیات، استهلاک"),
-    ("EV","ارزش شرکت"),
-    ("FCF","جریان نقد آزاد"),
-    ("DSO","دوره وصول مطالبات"),
-    ("DIO","دوره گردش موجودی"),
-    ("DPO","دوره پرداخت"),
-    ("CCC","DSO + DIO − DPO"),
-    ("TSR","بازده کل سهامدار"),
-    ("Graham","√(22.5 × EPS × BVPS)"),
+    ("EV","ارزش شرکت"), ("FCF","جریان نقد آزاد"),
+    ("DSO","دوره وصول مطالبات"), ("DIO","دوره گردش موجودی"),
+    ("DPO","دوره پرداخت"), ("CCC","DSO + DIO − DPO"),
+    ("TSR","بازده کل سهامدار"), ("Graham","√(22.5 × EPS × BVPS)"),
 ]
 
-# ═══════════════ سایدبار — صنعت و آپلود ═══════════════
+# ═══════════════ سایدبار ═══════════════
 st.sidebar.header("⚙️ تنظیمات")
 sk = st.sidebar.selectbox("صنعت", list(SECTOR_CONFIG.keys()),
                           format_func=lambda k: SECTOR_CONFIG[k]["name"], index=0)
 cfg = SECTOR_CONFIG[sk]
 
-uploaded = st.sidebar.file_uploader(
-    "صورت‌های مالی (چند فایل مجاز)",
-    type=["xlsx", "xls"],
-    accept_multiple_files=True,
-)
+uploaded = st.sidebar.file_uploader("صورت‌های مالی (چند فایل مجاز)",
+                                     type=["xlsx", "xls"], accept_multiple_files=True)
 
 # ═══════════════ پارس فایل‌ها ═══════════════
 data = {}
@@ -95,23 +94,18 @@ if uploaded:
                     try: f.seek(0)
                     except: pass
                     content = f.read()
-                else: content = bytes(f)
             except Exception as e:
-                file_report.append((f.name, 0, len(cfg["labels"]),
-                                    f"❌ خواندن: {str(e)[:60]}", 0, []))
+                file_report.append((f.name, 0, len(cfg["labels"]), f"❌ {str(e)[:60]}", 0))
                 continue
-
             if not content:
-                file_report.append((f.name, 0, len(cfg["labels"]), "❌ خالی", 0, []))
+                file_report.append((f.name, 0, len(cfg["labels"]), "❌ خالی", 0))
                 continue
 
             size = len(content)
             result, kind, errors = parse_any_format(content)
             if result is None:
                 file_report.append((f.name, 0, len(cfg["labels"]),
-                                    f"❌ {kind}، {size:,} بایت", 0, errors))
-                previews[f.name] = {"type": "error", "errors": errors,
-                                    "hex": content[:80].hex(), "kind": kind, "size": size}
+                                    f"❌ {kind}، {size:,} بایت", 0))
                 continue
 
             try:
@@ -121,175 +115,158 @@ if uploaded:
                     n_tables = len(result.sheet_names)
                 elif isinstance(result, list):
                     biggest = max(result, key=lambda d: d.shape[0] * d.shape[1])
-                    sample = biggest.head(40)
-                    n_tables = len(result)
+                    sample = biggest.head(40); n_tables = len(result)
                 else:
                     sample = result.head(40); n_tables = 1
                 previews[f.name] = sample
-            except Exception as e:
-                previews[f.name] = {"type": "error", "errors": [str(e)[:200]],
-                                    "hex": content[:80].hex(), "kind": kind, "size": size}
-                file_report.append((f.name, 0, len(cfg["labels"]),
-                                    f"❌ پیش‌نمایش: {str(e)[:60]}", 0, []))
-                continue
+            except: continue
 
             ncols = sample.shape[1] if not sample.empty else 0
 
             try:
                 extracted = extract_excel(io.BytesIO(content), cfg["labels"])
-            except Exception as e:
-                file_report.append((f.name, 0, len(cfg["labels"]),
-                                    f"❌ پارس: {str(e)[:60]}", ncols, []))
-                continue
+            except: continue
 
+            merge_prefer_larger(data, extracted)
             found = len([k for k, v in extracted.items() if not pd.isna(v)])
-            total_fields = len(cfg["labels"])
-            file_report.append((f.name, found, total_fields,
-                                f"{kind} | {n_tables} جدول | بزرگ‌ترین: {sample.shape[0]}×{ncols} | {size:,} بایت",
-                                ncols, []))
+            total = len(cfg["labels"])
+            file_report.append((f.name, found, total,
+                                f"{kind} | {n_tables} جدول | {size:,} بایت", ncols))
 
-            for k, v in extracted.items():
-                if k not in data or pd.isna(data.get(k)):
-                    data[k] = v
-
-# ═══════════════ استخراج خودکار تعداد سهام ═══════════════
-detected_shares = estimate_shares_bn(data)
-shares_valid = detected_shares and not pd.isna(detected_shares) and detected_shares > 0
-
-# ═══════════════ سایدبار — تعداد سهام ═══════════════
+# ═══════════════ تعداد سهام — دستی ═══════════════
 st.sidebar.divider()
-st.sidebar.subheader("📊 تعداد سهام")
+st.sidebar.subheader("📊 تعداد سهام (دستی)")
+st.sidebar.caption("⚠️ این عدد را از صورت‌های مالی یا سایت کدال بخوانید")
+st.sidebar.caption("فرمول: سرمایه(م.ریال) ÷ اسمی(ریال) ÷ ۱۰۰۰")
 
-if shares_valid:
-    st.sidebar.success(f"✅ استخراج‌شده: **{detected_shares:.2f} میلیارد**")
-    with st.sidebar.expander("🔍 جزئیات محاسبه"):
+# مقادیر یافت‌شده — فقط اطلاعاتی
+if data:
+    with st.sidebar.expander("🔍 مقادیر یافت‌شده در فایل (فقط اطلاع)"):
         cap = data.get("capital", np.nan)
         nom = data.get("nominal_value", np.nan)
-        if pd.isna(nom) or nom <= 0: nom = 1000
-        st.write(f"**سرمایه**: {cap:,.0f} میلیون ریال" if not pd.isna(cap) else "سرمایه: —")
-        st.write(f"**ارزش اسمی**: {nom:,.0f} ریال")
-        st.write(f"**فرمول**: سرمایه×۱۰⁶ ÷ اسمی ÷ ۱۰⁹")
-else:
-    st.sidebar.warning("⚠️ از صورت‌ها استخراج نشد — دستی وارد کنید")
+        if not pd.isna(cap) and cap > 0:
+            n = nom if not pd.isna(nom) and nom > 0 else 1000
+            calc = (cap * 1e6) / (n * 1e9)
+            st.write(f"**سرمایه**: {cap:,.0f} م.ریال")
+            st.write(f"**اسمی**: {n:,.0f} ریال")
+            st.write(f"**محاسبه**: {calc:.2f} میلیارد سهم")
+            st.warning("⚠️ این مقدار ممکن است اشتباه باشد — چند «سرمایه» در فایل هست")
+        else:
+            st.caption("سرمایه یافت نشد")
 
-# مقدار اولیه session state
+# محاسبه‌گر کمکی
+with st.sidebar.expander("🧮 محاسبه‌گر تعداد سهام"):
+    st.caption("اگر نمی‌دانید، اینجا محاسبه کنید")
+    cap_in = st.number_input("سرمایه (میلیون ریال)", min_value=0.0,
+                              value=300000000.0, step=1000000.0, key="calc_cap",
+                              format="%.0f")
+    nom_in = st.number_input("اسمی (ریال)", min_value=0.0,
+                              value=1000.0, step=100.0, key="calc_nom",
+                              format="%.0f")
+    if cap_in > 0 and nom_in > 0:
+        result_sh = (cap_in * 1e6) / (nom_in * 1e9)
+        st.success(f"**{result_sh:.2f} میلیارد سهم**")
+        if st.button("📋 استفاده در فیلد", key="use_calc"):
+            st.session_state.shares_input = float(result_sh)
+            st.rerun()
+
 if "shares_input" not in st.session_state:
-    st.session_state.shares_input = float(detected_shares) if shares_valid else 30.0
+    st.session_state.shares_input = 1.0
 
 shares = st.sidebar.number_input(
     "تعداد سهام (میلیارد)",
     min_value=0.01, step=0.1, format="%.2f",
     key="shares_input",
+    help="مثال: سرمایه ۳۰۰,۰۰۰,۰۰۰ م.ریال و اسمی ۱۰۰۰ → ۳۰۰ میلیارد سهم",
 )
 
-# هشدار اختلاف
-if shares_valid and abs(shares - detected_shares) > 0.01:
-    diff_pct = (shares - detected_shares) / detected_shares * 100
-    st.sidebar.warning(f"⚠️ مقدار واردشده {diff_pct:+.1f}% با استخراجی فاصله دارد")
-    if st.sidebar.button("🔄 بازنشانی به مقدار استخراجی", key="reset_sh"):
-        st.session_state.shares_input = float(detected_shares)
-        st.rerun()
-
-# ═══════════════ قیمت — ورودی + پیشنهاد ═══════════════
+# ═══════════════ قیمت — دستی ═══════════════
 st.sidebar.divider()
-st.sidebar.subheader("💰 قیمت سهم")
+st.sidebar.subheader("💰 قیمت سهم (دستی)")
+st.sidebar.caption("آخرین قیمت معامله در بازار")
 
 months = st.sidebar.selectbox("دوره صورت مالی (ماه)", [3, 6, 9, 12], index=3)
 
-# محاسبه موقت نسبت‌ها با فرض قیمت صفر برای گرفتن EPS/BVPS
-temp_ratios = cfg["fn"](data, p=1.0, sh=shares * 1e9, m=months)
-suggested, suggestion_list = suggest_price_toman(temp_ratios, cfg["benchmark"])
-
-if suggestion_list:
-    details = "\n".join([f"- {lbl}: **{v:,.0f} ت**" for lbl, v in suggestion_list])
-    st.sidebar.info(f"💡 قیمت پیشنهادی (بنچمارک صنعت):\n\n{details}\n\n**میانه: {suggested:,.0f} تومان**")
-    
-    if st.sidebar.button(f"📋 استفاده از میانه ({suggested:,.0f} ت)", key="use_sug"):
-        st.session_state.price_input = float(suggested)
-        st.rerun()
+# پیشنهاد قیمت — فقط اطلاعاتی
+if data:
+    with st.sidebar.expander("💡 قیمت پیشنهادی (فقط اطلاع)"):
+        temp_r = cfg["fn"](data, p=1.0, sh=shares*1e9, m=months)
+        sug, sug_list = suggest_price_toman(temp_r, cfg["benchmark"])
+        if sug_list:
+            for lbl, val in sug_list:
+                st.write(f"{lbl}: **{val:,.0f} ت**")
+            st.caption("⚠️ بر اساس داده‌های تاریخی — قیمت واقعی بازار را وارد کنید")
+        else:
+            st.caption("داده کافی برای پیشنهاد نیست")
 
 if "price_input" not in st.session_state:
-    st.session_state.price_input = float(suggested) if suggestion_list and not pd.isna(suggested) else 1000.0
+    st.session_state.price_input = 1000.0
 
 price = st.sidebar.number_input(
-    "قیمت سهم (تومان)",
+    "قیمت روز (تومان)",
     min_value=1.0, step=10.0, format="%.0f",
     key="price_input",
+    help="قیمت را به تومان وارد کنید — نه ریال. اگر ریال می‌دانید بر ۱۰ تقسیم کنید.",
 )
 
 dollar = st.sidebar.number_input("نرخ دلار (ریال) — اختیاری",
                                   min_value=0.0, value=700000.0, step=1000.0)
 
-# هشدار اختلاف قیمت با پیشنهاد
-if suggestion_list and not pd.isna(suggested) and suggested > 0:
-    diff = (price - suggested) / suggested * 100
-    if abs(diff) > 50:
-        st.sidebar.warning(
-            f"⚠️ قیمت واردشده **{diff:+.0f}%** با پیشنهاد بنچمارک "
-            f"({suggested:,.0f} ت) فاصله دارد — آیا قیمت روز را درست وارد کرده‌اید؟"
-        )
-
-# ═══════════════ محاسبه نهایی ═══════════════
+# ═══════════════ محاسبه ═══════════════
 ratios = cfg["fn"](data, p=price * 10, sh=shares * 1e9, m=months)
+warnings = health_check(ratios, price, shares, data)
 
 st.title(f"📊 داشبورد تحلیل — {cfg['name']}")
 st.caption(f"قیمت: **{price:,.0f} تومان** | سهام: **{shares:.2f} میلیارد** | دوره: **{months} ماه** | فایل‌ها: **{len(uploaded) if uploaded else 0}**")
 
-# هشدار داده خالی
-if uploaded and len([k for k, v in data.items() if not pd.isna(v)]) == 0:
-    st.markdown(
-        "<div class='bad-box'>🔴 هیچ داده‌ای استخراج نشد — در «نمای خام» نوع و hex را ببینید.</div>",
-        unsafe_allow_html=True
+# هشدارهای سلامت — بالا، برجسته
+if warnings:
+    st.markdown("### ⚠️ بررسی سلامت داده")
+    for w in warnings:
+        st.markdown(f"<div class='bad-box'>{w}</div>", unsafe_allow_html=True)
+
+# اطلاعات شفاف
+if uploaded:
+    st.markdown("### 🔍 اطلاعات محاسبه")
+    c1, c2, c3, c4 = st.columns(4)
+    cap = data.get("capital", np.nan)
+    nom = data.get("nominal_value", np.nan)
+    if pd.isna(nom) or nom <= 0: nom = 1000
+    c1.metric("تعداد سهام (دستی)", fmt(shares, dec=2) + " م.سهم")
+    c2.metric("قیمت (دستی)", fmt(price, dec=0) + " تومان")
+    c3.metric("EPS سالانه", fmt(ratios.get("EPS سالانه (ریال)"), dec=0) + " ریال")
+    c4.metric("Market Cap", fmt(ratios.get("Market Cap (همت)"), dec=0) + " همت")
+    st.caption(
+        f"📐 فرمول P/E = قیمت(ریال) ÷ EPS = {price*10:,.0f} ÷ {fmt(ratios.get('EPS سالانه (ریال)', dec=0))} = "
+        f"**{fmt(ratios.get('P/E'), dec=2)}**  •  "
+        f"P/B = قیمت(ریال) ÷ BVPS = {price*10:,.0f} ÷ {fmt(ratios.get('BVPS (ریال)', dec=0))} = "
+        f"**{fmt(ratios.get('P/B'), dec=2)}**"
     )
 
-# ═══════════════ نوار اعتبار داده ═══════════════
-if uploaded:
-    st.markdown("### 🔍 اعتبار داده‌های کلیدی")
-    c1, c2, c3, c4 = st.columns(4)
-    
-    capital_val = data.get("capital", np.nan)
-    nominal_val = data.get("nominal_value", np.nan)
-    if pd.isna(nominal_val) or nominal_val <= 0: nominal_val = 1000
-    
-    c1.metric("سرمایه (میلیون ریال)", fmt(capital_val, dec=0))
-    c2.metric("ارزش اسمی (ریال)", fmt(nominal_val, dec=0))
-    c3.metric("تعداد سهام (میلیارد)", fmt(shares, dec=2))
-    
-    eps_val = ratios.get("EPS سالانه (ریال)")
-    bvps_val = ratios.get("BVPS (ریال)")
-    c4.metric("EPS / BVPS", f"{fmt(eps_val, dec=0)} / {fmt(bvps_val, dec=0)}")
+# پوشش
+req = [k for k in cfg["labels"] if not k.endswith("_prev")]
+found = [k for k in req if not pd.isna(data.get(k))]
+miss = [k for k in req if pd.isna(data.get(k))]
+cov = int(len(found)/len(req)*100) if req else 0
+c1, c2 = st.columns([3, 1])
+c1.progress(cov, text=f"پوشش: {len(found)}/{len(req)} ({cov}٪)")
+c2.caption("⚠️ فیلد گم" if miss else "✅ کامل")
 
-# گزارش + debug
+# گزارش فایل
 if file_report:
     with st.expander("📋 گزارش پارس هر فایل", expanded=False):
         for row in file_report:
-            fname, found, total, note = row[0], row[1], row[2], row[3]
-            pct = int(found / total * 100) if total else 0
+            fname, found_n, total, note = row[0], row[1], row[2], row[3]
+            pct = int(found_n / total * 100) if total else 0
             icon = "🟢" if pct >= 40 else ("🟡" if pct >= 10 else "🔴")
-            st.write(f"{icon} **{fname}** — {found}/{total} ({pct}٪) — `{note}`")
-
-    with st.expander("🔬 نمای خام فایل (Debug)", expanded=False):
+            st.write(f"{icon} **{fname}** — {found_n}/{total} ({pct}٪) — `{note}`")
+    with st.expander("🔬 نمای خام (Debug)", expanded=False):
         for fname, *_ in file_report:
             st.markdown(f"### `{fname}`")
             pv = previews.get(fname)
             if isinstance(pv, pd.DataFrame):
-                st.write(f"**ابعاد**: {pv.shape[0]} سطر × {pv.shape[1]} ستون")
-                st.dataframe(pv, use_container_width=True, height=350)
-            elif isinstance(pv, dict) and pv.get("type") == "error":
-                st.error(f"❌ نوع: `{pv['kind']}` — {pv['size']:,} بایت")
-                for err in pv.get("errors", []): st.code(err)
-
-# پوشش
-req = [k for k in cfg["labels"] if not k.endswith("_prev")]
-found_all = [k for k in req if not pd.isna(data.get(k))]
-miss = [k for k in req if pd.isna(data.get(k))]
-cov = int(len(found_all) / len(req) * 100) if req else 0
-c1, c2 = st.columns([3, 1])
-c1.progress(cov, text=f"پوشش: {len(found_all)}/{len(req)} ({cov}٪)")
-c2.caption("⚠️ فیلد گم — تب «داده»" if miss else "✅ کامل")
-
-if not pd.isna(data.get("net_income")) and data.get("net_income", 0) < 0:
-    st.markdown("<div class='bad-box'>🔴 شرکت زیان‌ده است.</div>", unsafe_allow_html=True)
+                st.write(f"ابعاد: {pv.shape[0]}×{pv.shape[1]}")
+                st.dataframe(pv, use_container_width=True, height=300)
 
 # ═══════════════ تب‌ها ═══════════════
 T = st.tabs(["🏠 خلاصه", "📈 سود و زیان", "🏦 ترازنامه", "💰 ارزش‌گذاری",
@@ -306,14 +283,10 @@ with T[0]:
         cols[i % 5].metric(k, fmt(ratios.get(k), pct="%" in k or "Yield" in k, dec=2))
 
     flags = []
-    if not pd.isna(ratios.get("P/E")) and 0 < ratios.get("P/E", 99) < 4:
-        flags.append("🟢 P/E پایین")
-    if not pd.isna(ratios.get("P/B")) and 0 < ratios.get("P/B", 99) < 1:
-        flags.append("🟢 P/B زیر ۱")
-    if ratios.get("ROE (%)", 0) > 20:
-        flags.append("🟢 ROE بالای ۲۰٪")
-    if ratios.get("Debt/Equity", 0) > 2:
-        flags.append("🟡 اهرم بالا")
+    if not pd.isna(ratios.get("P/E")) and 0 < ratios.get("P/E", 99) < 4: flags.append("🟢 P/E پایین")
+    if not pd.isna(ratios.get("P/B")) and 0 < ratios.get("P/B", 99) < 1: flags.append("🟢 P/B زیر ۱")
+    if ratios.get("ROE (%)", 0) > 20: flags.append("🟢 ROE بالای ۲۰٪")
+    if ratios.get("Debt/Equity", 0) > 2: flags.append("🟡 اهرم بالا")
     if flags:
         st.subheader("🚩 پرچم‌ها")
         for f in flags: st.write(f)
@@ -340,35 +313,26 @@ with T[1]:
         x = ["فروش","بهای تمام","سود ناخالص","هزینه فروش","هزینه مالی","سایر","سود خالص"]
         y = [rev, -cs, gp, -sg, -fc, oth, ni]
         meas = ["relative","relative","total","relative","relative","relative","total"]
-
-    fig = go.Figure(go.Waterfall(
-        measure=meas, x=x, y=y,
+    fig = go.Figure(go.Waterfall(measure=meas, x=x, y=y,
         text=[f"{v:,.0f}" for v in y], textposition="outside",
         connector={"line": {"color": "#94a3b8"}},
         increasing={"marker": {"color": "#16a34a"}},
         decreasing={"marker": {"color": "#dc2626"}},
-        totals={"marker": {"color": "#2563eb"}},
-    ))
+        totals={"marker": {"color": "#2563eb"}}))
     fig.update_layout(height=440, showlegend=False, yaxis_title="همت")
     st.plotly_chart(fig, use_container_width=True)
 
 with T[2]:
-    ta = data.get("total_assets", 0) / 1e3
-    cash = data.get("cash", 0) / 1e3
-    eq = data.get("equity", 0) / 1e3
-    liab = data.get("total_liab", 0) / 1e3
-
+    ta = data.get("total_assets", 0) / 1e3; cash = data.get("cash", 0) / 1e3
+    eq = data.get("equity", 0) / 1e3; liab = data.get("total_liab", 0) / 1e3
     if sk == "holding":
-        li = data.get("long_inv", 0) / 1e3
-        asc = data.get("associates", 0) / 1e3
+        li = data.get("long_inv", 0) / 1e3; asc = data.get("associates", 0) / 1e3
         labels = ["نقد","سرمایه‌گذاری بلندمدت","وابسته","سایر"]
         vals = [cash, li, asc, max(0, ta - cash - li - asc)]
     else:
-        inv = data.get("inventory", 0) / 1e3
-        ar = data.get("receivables", 0) / 1e3
+        inv = data.get("inventory", 0) / 1e3; ar = data.get("receivables", 0) / 1e3
         labels = ["نقد","موجودی","مطالبات","سایر"]
         vals = [cash, inv, ar, max(0, ta - cash - inv - ar)]
-
     c1, c2 = st.columns(2)
     with c1:
         fig = px.pie(values=vals, names=labels, hole=0.55, title="ترکیب دارایی (همت)",
@@ -379,7 +343,6 @@ with T[2]:
                      title="ساختار سرمایه (همت)",
                      color_discrete_sequence=["#dc2626","#16a34a"])
         st.plotly_chart(fig, use_container_width=True)
-
     st.subheader("📊 نسبت‌های ساختاری")
     c1, c2, c3 = st.columns(3)
     c1.metric("بدهی/دارایی", fmt(safe_pct(liab, ta), pct=True))
@@ -398,14 +361,12 @@ with T[3]:
     eps = ratios.get("EPS سالانه (ریال)")
     if eps and not pd.isna(eps) and eps > 0:
         st.subheader("🎯 حساسیت P/E")
-        prices = np.linspace(price * 0.5, price * 2.0, 40)
+        prices = np.linspace(max(1, price*0.2), price * 2.0, 40)
         sens = pd.DataFrame({"قیمت": prices, "P/E": [(p * 10) / eps for p in prices]})
         fig = px.line(sens, x="قیمت", y="P/E", markers=True)
-        fig.add_hline(y=5, line_dash="dash", line_color="orange")
-        fig.add_vline(x=price, line_dash="dot", line_color="green")
-        if suggestion_list and not pd.isna(suggested):
-            fig.add_vline(x=suggested, line_dash="dash", line_color="blue",
-                          annotation_text=f"پیشنهاد: {suggested:,.0f}")
+        fig.add_hline(y=5, line_dash="dash", line_color="orange", annotation_text="P/E=5")
+        fig.add_hline(y=10, line_dash="dash", line_color="red", annotation_text="P/E=10")
+        fig.add_vline(x=price, line_dash="dot", line_color="green", annotation_text=f"فعلی {price:,.0f}")
         fig.update_layout(height=400)
         st.plotly_chart(fig, use_container_width=True)
 
@@ -490,7 +451,7 @@ with T[4]:
     if not pd.isna(target):
         if target > price * 1.2: score += 2
         elif target > price: score += 1
-    if not pd.isna(ratios.get("P/E")) and ratios.get("P/E") < 5: score += 1
+    if not pd.isna(ratios.get("P/E")) and 0 < ratios.get("P/E") < 5: score += 1
     if ratios.get("ROE (%)", ratios.get("ROE سالانه (%)", 0)) > 20: score += 1
     if (div_yield or 0) > 3: score += 1
     if score >= 4: v, c = "🟢 جذاب", "good-box"
@@ -519,7 +480,6 @@ with T[5]:
             k = row["کلید"]
             if pd.notna(row["جاری"]): data[k] = float(row["جاری"])
             if pd.notna(row["قبل"]): data[f"{k}_prev"] = float(row["قبل"])
-        st.session_state.pop("shares_input", None)  # بازنشانی تعداد سهام
         st.rerun()
 
     st.divider()
