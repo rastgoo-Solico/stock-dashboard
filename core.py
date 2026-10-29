@@ -1,4 +1,4 @@
-"""core.py — پارس اکسل/HTML کدال با تطبیق کامل حروف فارسی/عربی"""
+"""core.py — پارس اکسل/HTML کدال + استخراج خودکار تعداد سهام + پیشنهاد قیمت"""
 import re
 import io
 import pandas as pd
@@ -13,15 +13,10 @@ def to_en(s):
     return s
 
 def normalize_chars(s):
-    """یکسان‌سازی کامل حروف فارسی/عربی + حذف نویسه‌های نامرئی."""
-    return (s.replace("ي", "ی")     # Arabic yeh
-             .replace("ى", "ی")     # Alef maksura
-             .replace("ك", "ک")     # Arabic kaf
-             .replace("ة", "ه")     # Teh marbuta
-             .replace("\u200c", "") # ZWNJ
-             .replace("\u200f", "") # RLM
-             .replace("\u200e", "") # LRM
-             .replace("\u0640", ""))# Tatweel
+    return (s.replace("ي", "ی").replace("ى", "ی")
+             .replace("ك", "ک").replace("ة", "ه")
+             .replace("\u200c", "").replace("\u200f", "").replace("\u200e", "")
+             .replace("\u0640", ""))
 
 def norm_label(s):
     s = to_en(str(s))
@@ -49,7 +44,59 @@ def safe_add(*vs): return np.nan if any(pd.isna(v) for v in vs) else float(sum(v
 def safe_mul(a, b): return np.nan if pd.isna(a) or pd.isna(b) else a * b
 
 
-# ═══════════════ تشخیص و پارس فرمت ═══════════════
+# ═══════════════ استخراج خودکار تعداد سهام ═══════════════
+def estimate_shares_bn(data: dict) -> float:
+    """تخمین تعداد سهام (میلیارد) از سرمایه و ارزش اسمی.
+    
+    سرمایه در صورت‌ها به «میلیون ریال» است:
+        capital_rial = capital_million × 10^6
+        shares = capital_rial / nominal
+        shares_bn = shares / 10^9
+    بنابراین: shares_bn = capital_million / (nominal / 1000)
+    
+    برای سرمایه ۳۰۰,۰۰۰,۰۰۰ و اسمی ۱۰۰۰:
+        shares_bn = 300,000,000 / (1000/1000) = 300 میلیارد ✓
+    """
+    capital = data.get("capital", np.nan)
+    if pd.isna(capital) or capital <= 0:
+        return np.nan
+    
+    nominal = data.get("nominal_value", np.nan)
+    if pd.isna(nominal) or nominal <= 0:
+        nominal = 1000  # استاندارد بورس ایران
+    
+    return (capital * 1e6) / (nominal * 1e9)
+
+
+# ═══════════════ پیشنهاد قیمت بر اساس بنچمارک ═══════════════
+def suggest_price_toman(ratios: dict, benchmark: dict) -> tuple:
+    """قیمت پیشنهادی (تومان) از ۳ روش. برمی‌گرداند (median, [لیست روش‌ها])."""
+    eps = ratios.get("EPS سالانه (ریال)", np.nan)
+    bvps = ratios.get("BVPS (ریال)", np.nan)
+    peer_pe = benchmark.get("P/E", 6.0)
+    peer_pb = benchmark.get("P/B", 1.2)
+    
+    suggestions = []
+    labels = []
+    
+    if eps and not pd.isna(eps) and eps > 0:
+        suggestions.append(eps * peer_pe / 10)  # ریال → تومان
+        labels.append(f"P/E={peer_pe}×EPS")
+    
+    if bvps and not pd.isna(bvps) and bvps > 0:
+        suggestions.append(bvps * peer_pb / 10)
+        labels.append(f"P/B={peer_pb}×BVPS")
+    
+    if eps and bvps and eps > 0 and bvps > 0:
+        suggestions.append(np.sqrt(22.5 * eps * bvps) / 10)
+        labels.append("Graham")
+    
+    if suggestions:
+        return float(np.median(suggestions)), list(zip(labels, suggestions))
+    return np.nan, []
+
+
+# ═══════════════ پارس فایل ═══════════════
 def parse_any_format(content_bytes):
     if not content_bytes or len(content_bytes) < 8:
         return None, "empty", ["فایل خالی/خیلی کوچک"]
@@ -64,7 +111,6 @@ def parse_any_format(content_bytes):
 
     errors = []
 
-    # ۱. Excel
     if kind in ("xlsx", "xls", "unknown"):
         engines = ['xlrd', 'openpyxl'] if kind == "xls" else ['openpyxl', 'xlrd']
         for engine in engines:
@@ -73,17 +119,15 @@ def parse_any_format(content_bytes):
             except Exception as e:
                 errors.append(f"[excel-{engine}] {str(e)[:120]}")
 
-    # ۲. HTML — همه جداول را برمی‌گرداند
     if kind in ("html", "unknown"):
         for flavor in ['html5lib', 'bs4']:
             try:
                 dfs = pd.read_html(io.BytesIO(content_bytes), flavor=flavor)
                 if dfs:
-                    return dfs, f"html-{flavor}", errors  # ← لیست جداول برمی‌گردانیم
+                    return dfs, f"html-{flavor}", errors
             except Exception as e:
                 errors.append(f"[html-{flavor}] {str(e)[:120]}")
 
-    # ۳. CSV
     for enc in ['utf-8', 'utf-8-sig', 'windows-1256', 'latin-1']:
         try:
             text = content_bytes.decode(enc, errors='ignore')
@@ -101,7 +145,6 @@ def parse_any_format(content_bytes):
     return None, kind, errors
 
 
-# ═══════════════ استخراج ═══════════════
 def extract_excel(file_like, labels):
     try:
         if hasattr(file_like, 'getvalue'):
@@ -127,7 +170,6 @@ def extract_excel(file_like, labels):
             except Exception:
                 continue
     elif isinstance(result, list):
-        # HTML/CSV → لیست جداول — همه را به ترتیب پردازش کن
         for df in result:
             if df is not None and not df.empty and df.shape[0] >= 2:
                 _extract_from_raw(df, labels, out)
@@ -141,15 +183,11 @@ def _extract_from_raw(raw, labels, out):
     if raw is None or raw.empty:
         return
 
-    # ─── روش ۱: تطبیق چندستونی ───
     if raw.shape[1] >= 2:
-        n_rows = len(raw)
-        # همه ردیف‌ها را به عنوان «بالای جدول» امتحان کن — نه فقط ۱۵ تای اول
-        for hdr in range(min(n_rows, 30)):
+        for hdr in range(min(len(raw), 30)):
             df = raw.iloc[hdr + 1:].reset_index(drop=True)
             if df.empty or df.shape[1] < 2: continue
             col_a_norm = df.iloc[:, 0].astype(str).map(norm_label)
-
             for k, cands in labels.items():
                 if k in out and not pd.isna(out.get(k)): continue
                 for cand in cands:
@@ -170,7 +208,6 @@ def _extract_from_raw(raw, labels, out):
                         if len(nums) > 1: out[f"{k}_prev"] = nums[1]
                         break
 
-    # ─── روش ۲: متن‌کاوی (برای سلول‌های چسبیده) ───
     missing = [k for k in labels if k not in out or pd.isna(out.get(k))]
     if not missing: return
 
@@ -194,25 +231,18 @@ def _extract_from_raw(raw, labels, out):
 
 
 def numbers_after_label(text, label, max_nums=4):
-    """اعداد بعد از برچسب — با نرمال‌سازی حروف فارسی/عربی."""
     if not text or not label: return []
-    text_en = to_en(str(text))
-    text_norm = normalize_chars(text_en)
+    text_norm = normalize_chars(to_en(str(text)))
     label_norm = normalize_chars(label)
     if not label_norm: return []
-
     idx = text_norm.find(label_norm)
     if idx < 0: return []
-
     start = idx + len(label_norm)
     if start >= len(text_norm): return []
-
     preview = text_norm[start:start + 40]
     num_match = re.search(r'[\d]', preview)
     if not num_match: return []
-    before_num = preview[:num_match.start()]
-    if re.search(r'[\u0600-\u06FF]', before_num): return []
-
+    if re.search(r'[\u0600-\u06FF]', preview[:num_match.start()]): return []
     after = text_norm[start:start + 500]
     nums = []
     for m in re.finditer(r'\(?[\d][\d,]*(?:\.\d+)?\)?', after):
@@ -225,74 +255,60 @@ def numbers_after_label(text, label, max_nums=4):
 
 # ═══════════════ برچسب‌ها ═══════════════
 BANK_LABELS = {
-    "rev_loans":["درآمد تسهیلات اعطایی"],
-    "rev_fees":["درآمد کارمزد"],
-    "deposit_cost":["هزینه سود سپرده‌ها"],
-    "admin_cost":["هزینه های اداری و عمومی"],
-    "provision":["هزینه مطالبات مشکوک الوصول"],
-    "op_income":["درآمد عملیاتی"],
-    "op_profit":["سود (زیان) عملیاتی"],
-    "net_income":["سود (زیان) خالص"],
-    "eps":["سود (زیان) خالص هر سهم", "سود (زیان) پایه هر سهم"],
-    "cash":["موجودی نقد"],
-    "total_assets":["جمع دارایی‌ها"],
-    "total_liab":["جمع بدهی‌ها"],
-    "equity":["جمع حقوق مالکانه"],
+    "rev_loans":["درآمد تسهیلات اعطایی"], "rev_fees":["درآمد کارمزد"],
+    "deposit_cost":["هزینه سود سپرده‌ها"], "admin_cost":["هزینه های اداری و عمومی"],
+    "provision":["هزینه مطالبات مشکوک الوصول"], "op_income":["درآمد عملیاتی"],
+    "op_profit":["سود (زیان) عملیاتی"], "net_income":["سود (زیان) خالص"],
+    "eps":["سود (زیان) خالص هر سهم","سود (زیان) پایه هر سهم"],
+    "cash":["موجودی نقد"], "total_assets":["جمع دارایی‌ها"],
+    "total_liab":["جمع بدهی‌ها"], "equity":["جمع حقوق مالکانه"],
     "deposits":["سپرده‌های مشتریان"],
     "loans_gov":["تسهیلات اعطایی و مطالبات از اشخاص دولتی"],
-    "loans_nongov":["تسهیلات اعطایی و مطالبات از اشخاص غیر دولتی- ریالی",
-                     "تسهیلات اعطایی و مطالبات از اشخاص غیر دولتی"],
+    "loans_nongov":["تسهیلات اعطایی و مطالبات از اشخاص غیر دولتی- ریالی","تسهیلات اعطایی و مطالبات از اشخاص غیر دولتی"],
     "total_loans":["مانده تسهیلات پایان دوره"],
     "npl_doubtful":["ذخیره اختصاصی مطالبات مشکوک الوصول"],
+    "capital":["سرمایه"],
+    "nominal_value":["ارزش اسمی هر سهم (ریال)","ارزش اسمی هر سهم"],
 }
 GENERIC_LABELS = {
-    "revenue":["فروش", "درآمدهای عملیاتی"],
-    "cogs":["بهای تمام شده کالای فروش رفته", "بهای تمام شده"],
-    "sga":["هزینه های فروش، اداری و عمومی", "هزینه های اداری و عمومی"],
-    "op_profit":["سود (زیان) عملیاتی"],
-    "fin_cost":["هزینه های مالی"],
+    "revenue":["فروش","درآمدهای عملیاتی"],
+    "cogs":["بهای تمام شده کالای فروش رفته","بهای تمام شده"],
+    "sga":["هزینه های فروش، اداری و عمومی","هزینه های اداری و عمومی"],
+    "op_profit":["سود (زیان) عملیاتی"], "fin_cost":["هزینه های مالی"],
     "net_income":["سود (زیان) خالص"],
-    "eps":["سود (زیان) خالص هر سهم", "سود (زیان) پایه هر سهم", "سود هر سهم"],
-    "cash":["موجودی نقد"],
-    "receivables":["حساب ها و اسناد دریافتنی تجاری"],
-    "inventory":["موجودی مواد و کالا"],
-    "current_assets":["جمع دارایی‌های جاری"],
-    "total_assets":["جمع دارایی‌ها"],
-    "payables":["حساب ها و اسناد پرداختنی تجاری"],
+    "eps":["سود (زیان) خالص هر سهم","سود (زیان) پایه هر سهم","سود هر سهم"],
+    "cash":["موجودی نقد"], "receivables":["حساب ها و اسناد دریافتنی تجاری"],
+    "inventory":["موجودی مواد و کالا"], "current_assets":["جمع دارایی‌های جاری"],
+    "total_assets":["جمع دارایی‌ها"], "payables":["حساب ها و اسناد پرداختنی تجاری"],
     "current_liab":["جمع بدهی‌های جاری"],
-    "total_debt":["تسهیلات مالی دریافتی", "جمع بدهی‌ها"],
+    "total_debt":["تسهیلات مالی دریافتی","جمع بدهی‌ها"],
     "equity":["جمع حقوق مالکانه"],
     "cfo":["جریان خالص ورود (خروج) نقد حاصل از فعالیت های عملیاتی"],
     "capex":["پرداخت های نقدی برای تحصیل دارایی ثابت مشهود"],
+    "capital":["سرمایه"],
+    "nominal_value":["ارزش اسمی هر سهم (ریال)","ارزش اسمی هر سهم"],
 }
-PHARMA_LABELS = {**GENERIC_LABELS, "rd":["هزینه تحقیق و توسعه", "هزینه های تحقیق و توسعه"]}
+PHARMA_LABELS = {**GENERIC_LABELS, "rd":["هزینه تحقیق و توسعه","هزینه های تحقیق و توسعه"]}
 HOLDING_LABELS = {
-    "div_income":["درآمد سود سهام", "درآمد حاصل از سود سهام", "سود سهام"],
-    "interest_income":["درآمد سود تضمین شده", "درآمد سود تضمین‌شده"],
+    "div_income":["درآمد سود سهام","درآمد حاصل از سود سهام","سود سهام"],
+    "interest_income":["درآمد سود تضمین شده","درآمد سود تضمین‌شده"],
     "inv_sale_gain":["سود (زیان) فروش سرمایه گذاریها"],
     "inv_reval":["سود (زیان) تغییر ارزش سرمایه گذاریها"],
-    "other_rev":["سایر درآمدها"],
-    "rev_total":["جمع درآمدهای عملیاتی"],
-    "salary":["هزینه های حقوق، دستمزد و مزایا"],
-    "other_exp":["سایر هزینه‌ها"],
-    "op_exp_total":["جمع هزینه های عملیاتی"],
-    "op_profit":["سود (زیان) عملیاتی"],
-    "fin_cost":["هزینه های مالی"],
-    "non_op":["سایر درآمدها و هزینه‌های غیرعملیاتی"],
-    "pretax":["سود (زیان) عملیات در حال تداوم قبل از مالیات",
-              "سود (زیان) قبل از احتساب سهم گروه"],
+    "other_rev":["سایر درآمدها"], "rev_total":["جمع درآمدهای عملیاتی"],
+    "salary":["هزینه های حقوق، دستمزد و مزایا"], "other_exp":["سایر هزینه‌ها"],
+    "op_exp_total":["جمع هزینه های عملیاتی"], "op_profit":["سود (زیان) عملیاتی"],
+    "fin_cost":["هزینه های مالی"], "non_op":["سایر درآمدها و هزینه‌های غیرعملیاتی"],
+    "pretax":["سود (زیان) عملیات در حال تداوم قبل از مالیات","سود (زیان) قبل از احتساب سهم گروه"],
     "net_income":["سود (زیان) خالص"],
-    "eps":["سود (زیان) خالص هر سهم", "سود (زیان) پایه هر سهم"],
+    "eps":["سود (زیان) خالص هر سهم","سود (زیان) پایه هر سهم"],
     "capital":["سرمایه"],
-    "cash":["موجودی نقد"],
-    "short_inv":["سرمایه‌گذاری‌های کوتاه‌مدت"],
+    "nominal_value":["ارزش اسمی هر سهم (ریال)","ارزش اسمی هر سهم"],
+    "cash":["موجودی نقد"], "short_inv":["سرمایه‌گذاری‌های کوتاه‌مدت"],
     "long_inv":["سرمایه‌گذاری‌های بلندمدت"],
     "associates":["سرمایه گذاری در شرکتهای وابسته"],
-    "total_assets":["جمع دارایی‌ها"],
-    "total_liab":["جمع بدهی‌ها"],
-    "equity":["جمع حقوق مالکانه", "حقوق مالکانه قابل انتساب به مالکان شرکت اصلی"],
-    "current_assets":["جمع دارایی‌های جاری"],
-    "current_liab":["جمع بدهی‌های جاری"],
+    "total_assets":["جمع دارایی‌ها"], "total_liab":["جمع بدهی‌ها"],
+    "equity":["جمع حقوق مالکانه","حقوق مالکانه قابل انتساب به مالکان شرکت اصلی"],
+    "current_assets":["جمع دارایی‌های جاری"], "current_liab":["جمع بدهی‌های جاری"],
     "receivables":["دریافتنی‌های تجاری و سایر دریافتنی‌ها"],
     "cfo":["جریان خالص ورود (خروج) نقد حاصل از فعالیت های عملیاتی"],
     "dps_approved":["سود سهام مصوب"],
@@ -313,8 +329,7 @@ def bank_ratios(d, p, sh, m=6):
     bvps = safe_div(eq*1e6, sh)
     return {
         "EPS سالانه (ریال)": eps_a, "BVPS (ریال)": bvps,
-        "ROE سالانه (%)": safe_div(ni_a, eq)*100,
-        "ROA سالانه (%)": safe_div(ni_a, ta)*100,
+        "ROE سالانه (%)": safe_div(ni_a, eq)*100, "ROA سالانه (%)": safe_div(ni_a, ta)*100,
         "Cost-to-Income (%)": safe_div(abs(d.get("admin_cost", np.nan)), d.get("op_income", np.nan))*100,
         "حاشیه سود خالص (%)": safe_div(ni, d.get("op_income", np.nan))*100,
         "LDR (%)": safe_div(loans, d.get("deposits", np.nan))*100,
@@ -342,10 +357,8 @@ def generic_ratios(d, p, sh, m=6):
         "حاشیه سود ناخالص (%)": safe_div(safe_add(rev, -(cogs or 0)), rev)*100 if not pd.isna(rev) else np.nan,
         "حاشیه سود عملیاتی (%)": safe_div(d.get("op_profit", np.nan), rev)*100,
         "حاشیه سود خالص (%)": safe_div(ni, rev)*100,
-        "ROE (%)": safe_div(ni_a, eq)*100,
-        "ROA (%)": safe_div(ni_a, ta)*100,
-        "نسبت جاری": safe_div(ca, cl),
-        "Debt/Equity": safe_div(debt, eq),
+        "ROE (%)": safe_div(ni_a, eq)*100, "ROA (%)": safe_div(ni_a, ta)*100,
+        "نسبت جاری": safe_div(ca, cl), "Debt/Equity": safe_div(debt, eq),
         "Interest coverage": safe_div(d.get("op_profit", np.nan), abs(d["fin_cost"]) if not pd.isna(d.get("fin_cost", np.nan)) else np.nan),
         "گردش موجودی (بار)": safe_div(cogs*f, inv),
         "DSO (روز)": dso, "DIO (روز)": dio, "DPO (روز)": dpo, "CCC (روز)": ccc,
@@ -383,16 +396,14 @@ def holding_ratios(d, p, sh, m=12):
         dps = d["dps_approved"]*1e6/(d["capital"]*1e3)
     return {
         "EPS سالانه (ریال)": eps_a, "BVPS (ریال)": bvps,
-        "ROE (%)": safe_div(ni_a, eq)*100,
-        "ROA (%)": safe_div(ni_a, ta)*100,
+        "ROE (%)": safe_div(ni_a, eq)*100, "ROA (%)": safe_div(ni_a, ta)*100,
         "حاشیه سود خالص (%)": safe_div(ni, rev_tot)*100,
         "سهم سود سهام از درآمد (%)": safe_div(div_inc, rev_tot)*100,
         "درصد سرمایه‌گذاری از دارایی (%)": safe_div(total_inv, ta)*100,
         "نسبت جاری": safe_div(d.get("current_assets", np.nan), d.get("current_liab", np.nan)),
         "Debt/Equity": safe_div(d.get("total_liab", np.nan), eq),
         "P/E": safe_div(p, eps_a) if eps_a and eps_a > 0 else np.nan,
-        "P/B": safe_div(p, bvps),
-        "P/NAV (تخمینی)": safe_div(p, bvps),
+        "P/B": safe_div(p, bvps), "P/NAV (تخمینی)": safe_div(p, bvps),
         "Market Cap (همت)": safe_div(mcap, 1e12),
         "DPS (ریال)": dps,
         "بازده سود نقدی (%)": safe_div(dps, p)*100 if not pd.isna(dps) else np.nan,
@@ -400,8 +411,7 @@ def holding_ratios(d, p, sh, m=12):
 
 SECTOR_CONFIG = {
     "holding": {
-        "name": "هلدینگ / سرمایه‌گذاری",
-        "labels": HOLDING_LABELS, "fn": holding_ratios,
+        "name": "هلدینگ / سرمایه‌گذاری", "labels": HOLDING_LABELS, "fn": holding_ratios,
         "primary": ["P/E","P/B","P/NAV (تخمینی)","ROE (%)","حاشیه سود خالص (%)"],
         "secondary": ["EPS سالانه (ریال)","BVPS (ریال)","ROA (%)","Debt/Equity","بازده سود نقدی (%)"],
         "benchmark": {"P/E":6.0,"P/B":1.0,"ROE (%)":20},
