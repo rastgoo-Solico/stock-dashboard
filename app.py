@@ -1,11 +1,12 @@
-"""app.py — داشبورد چند-صنعتی تحلیل سهام"""
+"""app.py — داشبورد تحلیل سهام با استخراج خودکار تعداد سهام + پیشنهاد قیمت"""
 import io
 import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-from core import (SECTOR_CONFIG, extract_excel, parse_any_format)
+from core import (SECTOR_CONFIG, extract_excel, parse_any_format,
+                  estimate_shares_bn, suggest_price_toman)
 
 st.set_page_config(page_title="داشبورد تحلیل سهام", page_icon="📊",
                    layout="wide", initial_sidebar_state="expanded")
@@ -25,6 +26,8 @@ h1,h2,h3 { color:#0f172a; }
 .good-box { background:#dcfce7; border-right:4px solid #16a34a; padding:12px;
   border-radius:8px; margin:8px 0; direction:rtl; }
 .bad-box { background:#fee2e2; border-right:4px solid #dc2626; padding:12px;
+  border-radius:8px; margin:8px 0; direction:rtl; }
+.info-box { background:#dbeafe; border-right:4px solid #2563eb; padding:12px;
   border-radius:8px; margin:8px 0; direction:rtl; }
 </style>
 """, unsafe_allow_html=True)
@@ -65,6 +68,7 @@ GLOSSARY = [
     ("Graham","√(22.5 × EPS × BVPS)"),
 ]
 
+# ═══════════════ سایدبار — صنعت و آپلود ═══════════════
 st.sidebar.header("⚙️ تنظیمات")
 sk = st.sidebar.selectbox("صنعت", list(SECTOR_CONFIG.keys()),
                           format_func=lambda k: SECTOR_CONFIG[k]["name"], index=0)
@@ -76,14 +80,7 @@ uploaded = st.sidebar.file_uploader(
     accept_multiple_files=True,
 )
 
-st.sidebar.subheader("💰 پارامترها")
-price = st.sidebar.number_input("قیمت سهم (تومان)", min_value=1.0, value=1000.0, step=10.0)
-shares = st.sidebar.number_input("تعداد سهام (میلیارد)", min_value=0.01, value=30.0, step=0.1, format="%.2f")
-months = st.sidebar.selectbox("دوره (ماه)", [3, 6, 9, 12], index=3)
-dollar = st.sidebar.number_input("دلار (ریال)", min_value=0.0, value=700000.0, step=1000.0)
-
-
-# ═══════════════ پارس ═══════════════
+# ═══════════════ پارس فایل‌ها ═══════════════
 data = {}
 file_report = []
 previews = {}
@@ -109,8 +106,6 @@ if uploaded:
                 continue
 
             size = len(content)
-            magic_str = content[:8].hex()
-
             result, kind, errors = parse_any_format(content)
             if result is None:
                 file_report.append((f.name, 0, len(cfg["labels"]),
@@ -119,20 +114,17 @@ if uploaded:
                                     "hex": content[:80].hex(), "kind": kind, "size": size}
                 continue
 
-            # پیش‌نمایش
             try:
                 if isinstance(result, pd.ExcelFile):
                     sample = pd.read_excel(result, sheet_name=result.sheet_names[0],
                                            header=None, nrows=40)
                     n_tables = len(result.sheet_names)
                 elif isinstance(result, list):
-                    # بزرگ‌ترین جدول را برای پیش‌نمایش انتخاب کن
                     biggest = max(result, key=lambda d: d.shape[0] * d.shape[1])
                     sample = biggest.head(40)
                     n_tables = len(result)
                 else:
-                    sample = result.head(40)
-                    n_tables = 1
+                    sample = result.head(40); n_tables = 1
                 previews[f.name] = sample
             except Exception as e:
                 previews[f.name] = {"type": "error", "errors": [str(e)[:200]],
@@ -160,22 +152,116 @@ if uploaded:
                 if k not in data or pd.isna(data.get(k)):
                     data[k] = v
 
+# ═══════════════ استخراج خودکار تعداد سهام ═══════════════
+detected_shares = estimate_shares_bn(data)
+shares_valid = detected_shares and not pd.isna(detected_shares) and detected_shares > 0
 
-# هشدار
-if uploaded and len([k for k, v in data.items() if not pd.isna(v)]) == 0:
-    st.markdown(
-        "<div class='bad-box'>🔴 هیچ داده‌ای استخراج نشد — در «نمای خام» نوع، hex، و خطاها را ببینید.</div>",
-        unsafe_allow_html=True
-    )
+# ═══════════════ سایدبار — تعداد سهام ═══════════════
+st.sidebar.divider()
+st.sidebar.subheader("📊 تعداد سهام")
 
+if shares_valid:
+    st.sidebar.success(f"✅ استخراج‌شده: **{detected_shares:.2f} میلیارد**")
+    with st.sidebar.expander("🔍 جزئیات محاسبه"):
+        cap = data.get("capital", np.nan)
+        nom = data.get("nominal_value", np.nan)
+        if pd.isna(nom) or nom <= 0: nom = 1000
+        st.write(f"**سرمایه**: {cap:,.0f} میلیون ریال" if not pd.isna(cap) else "سرمایه: —")
+        st.write(f"**ارزش اسمی**: {nom:,.0f} ریال")
+        st.write(f"**فرمول**: سرمایه×۱۰⁶ ÷ اسمی ÷ ۱۰⁹")
+else:
+    st.sidebar.warning("⚠️ از صورت‌ها استخراج نشد — دستی وارد کنید")
+
+# مقدار اولیه session state
+if "shares_input" not in st.session_state:
+    st.session_state.shares_input = float(detected_shares) if shares_valid else 30.0
+
+shares = st.sidebar.number_input(
+    "تعداد سهام (میلیارد)",
+    min_value=0.01, step=0.1, format="%.2f",
+    key="shares_input",
+)
+
+# هشدار اختلاف
+if shares_valid and abs(shares - detected_shares) > 0.01:
+    diff_pct = (shares - detected_shares) / detected_shares * 100
+    st.sidebar.warning(f"⚠️ مقدار واردشده {diff_pct:+.1f}% با استخراجی فاصله دارد")
+    if st.sidebar.button("🔄 بازنشانی به مقدار استخراجی", key="reset_sh"):
+        st.session_state.shares_input = float(detected_shares)
+        st.rerun()
+
+# ═══════════════ قیمت — ورودی + پیشنهاد ═══════════════
+st.sidebar.divider()
+st.sidebar.subheader("💰 قیمت سهم")
+
+months = st.sidebar.selectbox("دوره صورت مالی (ماه)", [3, 6, 9, 12], index=3)
+
+# محاسبه موقت نسبت‌ها با فرض قیمت صفر برای گرفتن EPS/BVPS
+temp_ratios = cfg["fn"](data, p=1.0, sh=shares * 1e9, m=months)
+suggested, suggestion_list = suggest_price_toman(temp_ratios, cfg["benchmark"])
+
+if suggestion_list:
+    details = "\n".join([f"- {lbl}: **{v:,.0f} ت**" for lbl, v in suggestion_list])
+    st.sidebar.info(f"💡 قیمت پیشنهادی (بنچمارک صنعت):\n\n{details}\n\n**میانه: {suggested:,.0f} تومان**")
+    
+    if st.sidebar.button(f"📋 استفاده از میانه ({suggested:,.0f} ت)", key="use_sug"):
+        st.session_state.price_input = float(suggested)
+        st.rerun()
+
+if "price_input" not in st.session_state:
+    st.session_state.price_input = float(suggested) if suggestion_list and not pd.isna(suggested) else 1000.0
+
+price = st.sidebar.number_input(
+    "قیمت سهم (تومان)",
+    min_value=1.0, step=10.0, format="%.0f",
+    key="price_input",
+)
+
+dollar = st.sidebar.number_input("نرخ دلار (ریال) — اختیاری",
+                                  min_value=0.0, value=700000.0, step=1000.0)
+
+# هشدار اختلاف قیمت با پیشنهاد
+if suggestion_list and not pd.isna(suggested) and suggested > 0:
+    diff = (price - suggested) / suggested * 100
+    if abs(diff) > 50:
+        st.sidebar.warning(
+            f"⚠️ قیمت واردشده **{diff:+.0f}%** با پیشنهاد بنچمارک "
+            f"({suggested:,.0f} ت) فاصله دارد — آیا قیمت روز را درست وارد کرده‌اید؟"
+        )
+
+# ═══════════════ محاسبه نهایی ═══════════════
 ratios = cfg["fn"](data, p=price * 10, sh=shares * 1e9, m=months)
 
 st.title(f"📊 داشبورد تحلیل — {cfg['name']}")
 st.caption(f"قیمت: **{price:,.0f} تومان** | سهام: **{shares:.2f} میلیارد** | دوره: **{months} ماه** | فایل‌ها: **{len(uploaded) if uploaded else 0}**")
 
+# هشدار داده خالی
+if uploaded and len([k for k, v in data.items() if not pd.isna(v)]) == 0:
+    st.markdown(
+        "<div class='bad-box'>🔴 هیچ داده‌ای استخراج نشد — در «نمای خام» نوع و hex را ببینید.</div>",
+        unsafe_allow_html=True
+    )
+
+# ═══════════════ نوار اعتبار داده ═══════════════
+if uploaded:
+    st.markdown("### 🔍 اعتبار داده‌های کلیدی")
+    c1, c2, c3, c4 = st.columns(4)
+    
+    capital_val = data.get("capital", np.nan)
+    nominal_val = data.get("nominal_value", np.nan)
+    if pd.isna(nominal_val) or nominal_val <= 0: nominal_val = 1000
+    
+    c1.metric("سرمایه (میلیون ریال)", fmt(capital_val, dec=0))
+    c2.metric("ارزش اسمی (ریال)", fmt(nominal_val, dec=0))
+    c3.metric("تعداد سهام (میلیارد)", fmt(shares, dec=2))
+    
+    eps_val = ratios.get("EPS سالانه (ریال)")
+    bvps_val = ratios.get("BVPS (ریال)")
+    c4.metric("EPS / BVPS", f"{fmt(eps_val, dec=0)} / {fmt(bvps_val, dec=0)}")
+
 # گزارش + debug
 if file_report:
-    with st.expander("📋 گزارش پارس هر فایل", expanded=True):
+    with st.expander("📋 گزارش پارس هر فایل", expanded=False):
         for row in file_report:
             fname, found, total, note = row[0], row[1], row[2], row[3]
             pct = int(found / total * 100) if total else 0
@@ -191,9 +277,6 @@ if file_report:
                 st.dataframe(pv, use_container_width=True, height=350)
             elif isinstance(pv, dict) and pv.get("type") == "error":
                 st.error(f"❌ نوع: `{pv['kind']}` — {pv['size']:,} بایت")
-                c1, c2 = st.columns(2)
-                with c1: st.code(pv.get("magic", ""))
-                with c2: st.code(pv.get("hex", ""))
                 for err in pv.get("errors", []): st.code(err)
 
 # پوشش
@@ -320,6 +403,9 @@ with T[3]:
         fig = px.line(sens, x="قیمت", y="P/E", markers=True)
         fig.add_hline(y=5, line_dash="dash", line_color="orange")
         fig.add_vline(x=price, line_dash="dot", line_color="green")
+        if suggestion_list and not pd.isna(suggested):
+            fig.add_vline(x=suggested, line_dash="dash", line_color="blue",
+                          annotation_text=f"پیشنهاد: {suggested:,.0f}")
         fig.update_layout(height=400)
         st.plotly_chart(fig, use_container_width=True)
 
@@ -433,6 +519,7 @@ with T[5]:
             k = row["کلید"]
             if pd.notna(row["جاری"]): data[k] = float(row["جاری"])
             if pd.notna(row["قبل"]): data[f"{k}_prev"] = float(row["قبل"])
+        st.session_state.pop("shares_input", None)  # بازنشانی تعداد سهام
         st.rerun()
 
     st.divider()
