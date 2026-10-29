@@ -1,5 +1,6 @@
-"""core.py — پارس اکسل کدال + نسبت‌های ۶ صنعت (بانک، پترو، دارو، خودرو، هلدینگ، عمومی)"""
+"""core.py — پارس چند-Engine + متن‌کاوی برای فایل‌های تک‌ستونی کدال"""
 import re
+import io
 import pandas as pd
 import numpy as np
 
@@ -29,41 +30,115 @@ def safe_div(a,b):
 def safe_add(*vs): return np.nan if any(pd.isna(v) for v in vs) else float(sum(vs))
 def safe_mul(a,b): return np.nan if pd.isna(a) or pd.isna(b) else a*b
 
-def find_row(df, cands):
-    if df.shape[1] < 2 or df.empty: return None
-    col_a=df.iloc[:,0].astype(str).map(norm_label)
-    for c in cands:
-        m=col_a==norm_label(c)
-        if m.any(): return df[m].iloc[0]
-    for c in cands:
-        cn=norm_label(c)
-        if len(cn)<4: continue
-        m=col_a.str.contains(re.escape(cn),na=False)
-        if m.any(): return df[m].iloc[0]
+# ═══════════════ خواندن چند-Engine ═══════════════
+def read_excel_safe(content_bytes):
+    """کدال فایل .xls می‌دهد ولی محتوایش .xlsx است — هر دو را امتحان کن."""
+    for engine in ['openpyxl', 'xlrd', 'calamine', None]:
+        try:
+            bio = io.BytesIO(content_bytes)
+            return pd.ExcelFile(bio, engine=engine)
+        except Exception:
+            continue
     return None
 
+# ═══════════════ متن‌کاوی برای فایل تک‌ستونی ═══════════════
+def numbers_after_label(text, label, max_nums=4):
+    """اعداد بعد از یک برچسب در متن چسبیده را پیدا می‌کند."""
+    if not text or not label: return []
+    text_en = to_en(str(text))
+    search_start = 0
+    while True:
+        idx = text_en.find(label, search_start)
+        if idx < 0: return []
+        end_idx = idx + len(label)
+        if end_idx >= len(text_en): return []
+        preview = text_en[end_idx:end_idx + 40]
+        num_match = re.search(r'[\d]', preview)
+        if not num_match:
+            search_start = end_idx; continue
+        before_num = preview[:num_match.start()]
+        # اگر قبل از عدد حرف فارسی هست → تطبیق ناقص، رد شو
+        if re.search(r'[\u0600-\u06FF]', before_num):
+            search_start = end_idx; continue
+        after = text_en[end_idx:end_idx + 400]
+        nums = []
+        for m in re.finditer(r'\(?[\d][\d,]*(?:\.\d+)?\)?', after):
+            n = parse_num(m.group())
+            if not pd.isna(n):
+                nums.append(n)
+                if len(nums) >= max_nums: break
+        return nums
+
+# ═══════════════ استخراج اصلی ═══════════════
 def extract_excel(file_like, labels):
-    out={}
-    try: xls=pd.ExcelFile(file_like)
-    except Exception: return out
+    out = {}
+    try:
+        if hasattr(file_like, 'getvalue'):
+            content = file_like.getvalue()
+        elif hasattr(file_like, 'read'):
+            file_like.seek(0)
+            content = file_like.read()
+        else:
+            content = file_like
+    except Exception:
+        return out
+
+    xls = read_excel_safe(content)
+    if xls is None:
+        return out
+
     for sh in xls.sheet_names:
-        try: raw=pd.read_excel(xls,sheet_name=sh,header=None)
-        except Exception: continue
-        for hdr in range(min(6,len(raw))):
-            df=raw.iloc[hdr+1:].reset_index(drop=True)
-            if df.shape[1]<2 or df.empty: continue
-            for k,cands in labels.items():
+        try:
+            raw = pd.read_excel(xls, sheet_name=sh, header=None)
+        except Exception:
+            continue
+        if raw.empty: continue
+
+        # ─── روش ۱: چندستونی ───
+        for hdr in range(min(12, len(raw))):
+            df = raw.iloc[hdr+1:].reset_index(drop=True)
+            if df.empty: continue
+            col_a_norm = df.iloc[:, 0].astype(str).map(norm_label)
+            for k, cands in labels.items():
                 if k in out and not pd.isna(out[k]): continue
-                row=find_row(df,cands)
-                if row is None: continue
-                nums=[]
-                for c in df.columns[1:6]:
-                    v=parse_num(row.get(c))
-                    if not pd.isna(v): nums.append(v)
-                    if len(nums)>=2: break
-                if nums:
-                    out[k]=nums[0]
-                    if len(nums)>1: out[f"{k}_prev"]=nums[1]
+                for cand in cands:
+                    cn = norm_label(cand)
+                    mask = col_a_norm == cn
+                    if not mask.any() and len(cn) >= 4:
+                        mask = col_a_norm.str.contains(re.escape(cn), na=False)
+                    if not mask.any(): continue
+                    row = df[mask].iloc[0]
+                    nums = []
+                    for c in df.columns[1:12]:
+                        v = parse_num(row.get(c))
+                        if not pd.isna(v): nums.append(v)
+                        if len(nums) >= 2: break
+                    if nums:
+                        out[k] = nums[0]
+                        if len(nums) > 1: out[f"{k}_prev"] = nums[1]
+                        break
+
+        # ─── روش ۲: متن‌کاوی (برای فایل‌های تک‌ستونی چسبیده) ───
+        missing = [k for k in labels if k not in out or pd.isna(out.get(k))]
+        if missing:
+            for idx in range(len(raw)):
+                for col in raw.columns:
+                    cell = raw.iloc[idx][col]
+                    if pd.isna(cell): continue
+                    text = str(cell)
+                    if len(text) < 15: continue
+                    for k in list(missing):
+                        if k in out and not pd.isna(out[k]):
+                            if k in missing: missing.remove(k)
+                            continue
+                        for cand in labels[k]:
+                            nums = numbers_after_label(text, cand)
+                            if nums:
+                                out[k] = nums[0]
+                                if len(nums) > 1: out[f"{k}_prev"] = nums[1]
+                                if k in missing: missing.remove(k)
+                                break
+
     return out
 
 # ═══════════════ برچسب‌ها ═══════════════
@@ -108,26 +183,24 @@ GENERIC_LABELS = {
     "capex":["پرداخت های نقدی برای تحصیل دارایی ثابت مشهود"],
 }
 PHARMA_LABELS = {**GENERIC_LABELS,"rd":["هزینه تحقیق و توسعه","هزینه های تحقیق و توسعه"]}
-
-# ═══ هلدینگ / سرمایه‌گذاری — کلید فایل شما ═══
 HOLDING_LABELS = {
     "div_income":["درآمد سود سهام","درآمد حاصل از سود سهام"],
     "interest_income":["درآمد سود تضمین شده","درآمد سود تضمین‌شده"],
     "inv_sale_gain":["سود (زیان) فروش سرمایه گذاریها","سود (زیان) فروش سرمایه‌گذاریها","سود (زیان) فروش سرمایه گذاری"],
-    "inv_reval":["سود (زیان) تغییر ارزش سرمایه گذاریها","سود (زیان) تعدیل ذخیره کاهش ارزش سرمایه گذاریهای کوتاه مدت"],
+    "inv_reval":["سود (زیان) تغییر ارزش سرمایه گذاریها"],
     "other_rev":["سایر درآمدها"],
     "rev_total":["جمع درآمدهای عملیاتی"],
-    "salary":["هزینه هاى حقوق، دستمزد و مزایا","هزینه‌های حقوق، دستمزد و مزایا"],
+    "salary":["هزینه هاى حقوق، دستمزد و مزایا","هزینه‌های حقوق، دستمزد و مزایا","هزينه ‏هاى حقوق، دستمزد و مزایا"],
     "other_exp":["سایر هزینه‌ها","ساير هزینه‌ها"],
     "op_exp_total":["جمع هزینه های عملیاتی"],
-    "op_profit":["سود (زیان) عملياتى","سود (زیان) عملیاتی"],
+    "op_profit":["سود (زیان) عملياتى","سود (زیان) عملیاتی","سود (زیان) عملياتي"],
     "fin_cost":["هزینه های مالی","هزینه‌های مالی","هزينه‌ هاى مالى"],
-    "non_op":["سایر درآمدها و هزینه‌های غیرعملیاتی","ساير درآمدها و هزينه ‏هاى غيرعملياتى"],
-    "pretax":["سود (زیان) عملیات در حال تداوم قبل از ماليات","سود (زیان) قبل از احتساب سهم گروه"],
+    "non_op":["سایر درآمدها و هزینه‌های غیرعملیاتی"],
+    "pretax":["سود (زیان) عملیات در حال تداوم قبل از ماليات"],
     "net_income":["سود (زیان) خالص","سود(زیان)خالص","سود (زیان) خالص عملیات در حال تداوم"],
     "eps":["سود (زیان) خالص هر سهم (ریال)","سود (زیان) پایه هر سهم","سود (زیان) خالص هر سهم"],
     "capital":["سرمايه","سرمایه"],
-    "cash":["موجودی نقد","موجودی نقد"],
+    "cash":["موجودی نقد"],
     "short_inv":["سرمایه‌گذاری‌های کوتاه‌مدت","سرمایه گذاریهای کوتاه مدت"],
     "long_inv":["سرمایه‌گذاری‌های بلندمدت","سرمایه گذاریهای بلندمدت"],
     "associates":["سرمایه گذاری در شرکتهای وابسته","سرمایه‌گذاری در شرکت‌های وابسته"],
@@ -152,19 +225,19 @@ def bank_ratios(d,p,sh,m=6):
     if pd.isna(loans) or loans==0:
         loans=safe_add(d.get("loans_gov",0) or 0,d.get("loans_nongov",0) or 0)
     bvps=safe_div(eq*1e6,sh)
-    r={}
-    r["EPS سالانه (ریال)"]=eps_a; r["BVPS (ریال)"]=bvps
-    r["ROE سالانه (%)"]=safe_div(ni_a,eq)*100; r["ROA سالانه (%)"]=safe_div(ni_a,ta)*100
-    r["Cost-to-Income (%)"]=safe_div(abs(d.get("admin_cost",np.nan)),d.get("op_income",np.nan))*100
-    r["حاشیه سود خالص (%)"]=safe_div(ni,d.get("op_income",np.nan))*100
-    r["LDR (%)"]=safe_div(loans,d.get("deposits",np.nan))*100
-    r["پوشش ذخیره (%)"]=safe_div(d.get("npl_doubtful",np.nan),loans)*100
-    r["نقد/دارایی (%)"]=safe_div(d.get("cash",np.nan),ta)*100
-    r["بدهی/دارایی (%)"]=safe_div(d.get("total_liab",np.nan),ta)*100
-    r["P/E"]=safe_div(p,eps_a); r["P/B"]=safe_div(p,bvps)
-    r["Earnings Yield (%)"]=safe_div(eps_a,p)*100
-    r["Market Cap (همت)"]=safe_div(p*sh,1e12)
-    return r
+    return {
+        "EPS سالانه (ریال)":eps_a,"BVPS (ریال)":bvps,
+        "ROE سالانه (%)":safe_div(ni_a,eq)*100,"ROA سالانه (%)":safe_div(ni_a,ta)*100,
+        "Cost-to-Income (%)":safe_div(abs(d.get("admin_cost",np.nan)),d.get("op_income",np.nan))*100,
+        "حاشیه سود خالص (%)":safe_div(ni,d.get("op_income",np.nan))*100,
+        "LDR (%)":safe_div(loans,d.get("deposits",np.nan))*100,
+        "پوشش ذخیره (%)":safe_div(d.get("npl_doubtful",np.nan),loans)*100,
+        "نقد/دارایی (%)":safe_div(d.get("cash",np.nan),ta)*100,
+        "بدهی/دارایی (%)":safe_div(d.get("total_liab",np.nan),ta)*100,
+        "P/E":safe_div(p,eps_a),"P/B":safe_div(p,bvps),
+        "Earnings Yield (%)":safe_div(eps_a,p)*100,
+        "Market Cap (همت)":safe_div(p*sh,1e12),
+    }
 
 def generic_ratios(d,p,sh,m=6):
     f=12/m; rev=d.get("revenue",np.nan)
@@ -178,21 +251,21 @@ def generic_ratios(d,p,sh,m=6):
     eps_a=safe_div(ni_a*1e6,sh); bvps=safe_div(eq*1e6,sh); mcap=p*sh; days=30*m
     dso=safe_div(ar,rev)*days; dio=safe_div(inv,cogs)*days; dpo=safe_div(ap,cogs)*days
     ccc=(dso+dio-dpo) if not (pd.isna(dso) or pd.isna(dio) or pd.isna(dpo)) else np.nan
-    r={}
-    r["حاشیه سود ناخالص (%)"]=safe_div(safe_add(rev,-(cogs or 0)),rev)*100 if not pd.isna(rev) else np.nan
-    r["حاشیه سود عملیاتی (%)"]=safe_div(d.get("op_profit",np.nan),rev)*100
-    r["حاشیه سود خالص (%)"]=safe_div(ni,rev)*100
-    r["ROE (%)"]=safe_div(ni_a,eq)*100; r["ROA (%)"]=safe_div(ni_a,ta)*100
-    r["نسبت جاری"]=safe_div(ca,cl); r["Debt/Equity"]=safe_div(debt,eq)
-    r["Interest coverage"]=safe_div(d.get("op_profit",np.nan),abs(d["fin_cost"]) if not pd.isna(d.get("fin_cost",np.nan)) else np.nan)
-    r["گردش موجودی (بار)"]=safe_div(cogs*f,inv)
-    r["DSO (روز)"]=dso; r["DIO (روز)"]=dio; r["DPO (روز)"]=dpo; r["CCC (روز)"]=ccc
-    r["FCF Yield (%)"]=safe_div((cfo*f-abs(capex*f))*1e6,mcap)*100
-    r["EPS سالانه (ریال)"]=eps_a; r["BVPS (ریال)"]=bvps
-    r["P/E"]=safe_div(p,eps_a) if eps_a and eps_a>0 else np.nan
-    r["P/B"]=safe_div(p,bvps); r["P/S"]=safe_div(mcap,rev*f*1e6)
-    r["Market Cap (همت)"]=safe_div(mcap,1e12)
-    return r
+    return {
+        "حاشیه سود ناخالص (%)":safe_div(safe_add(rev,-(cogs or 0)),rev)*100 if not pd.isna(rev) else np.nan,
+        "حاشیه سود عملیاتی (%)":safe_div(d.get("op_profit",np.nan),rev)*100,
+        "حاشیه سود خالص (%)":safe_div(ni,rev)*100,
+        "ROE (%)":safe_div(ni_a,eq)*100,"ROA (%)":safe_div(ni_a,ta)*100,
+        "نسبت جاری":safe_div(ca,cl),"Debt/Equity":safe_div(debt,eq),
+        "Interest coverage":safe_div(d.get("op_profit",np.nan),abs(d["fin_cost"]) if not pd.isna(d.get("fin_cost",np.nan)) else np.nan),
+        "گردش موجودی (بار)":safe_div(cogs*f,inv),
+        "DSO (روز)":dso,"DIO (روز)":dio,"DPO (روز)":dpo,"CCC (روز)":ccc,
+        "FCF Yield (%)":safe_div((cfo*f-abs(capex*f))*1e6,mcap)*100,
+        "EPS سالانه (ریال)":eps_a,"BVPS (ریال)":bvps,
+        "P/E":safe_div(p,eps_a) if eps_a and eps_a>0 else np.nan,
+        "P/B":safe_div(p,bvps),"P/S":safe_div(mcap,rev*f*1e6),
+        "Market Cap (همت)":safe_div(mcap,1e12),
+    }
 
 def petro_ratios(d,p,sh,m=6):
     r=generic_ratios(d,p,sh,m); f=12/m
@@ -213,31 +286,27 @@ def holding_ratios(d,p,sh,m=12):
     eq=d.get("equity",np.nan); ta=d.get("total_assets",np.nan)
     eps=d.get("eps",np.nan); eps_a=eps*f if not pd.isna(eps) else safe_div(ni_a*1e6,sh)
     bvps=safe_div(eq*1e6,sh); mcap=p*sh
-    # دارایی‌های سرمایه‌گذاری
     long_inv=d.get("long_inv",np.nan); assoc=d.get("associates",np.nan); short_inv=d.get("short_inv",np.nan)
     total_inv=safe_add(*[v for v in [long_inv,assoc,short_inv] if not pd.isna(v)])
-    div_inc=d.get("div_income",np.nan)
-    rev_tot=d.get("rev_total",np.nan)
-    r={}
-    r["EPS سالانه (ریال)"]=eps_a; r["BVPS (ریال)"]=bvps
-    r["ROE (%)"]=safe_div(ni_a,eq)*100
-    r["ROA (%)"]=safe_div(ni_a,ta)*100
-    r["حاشیه سود خالص (%)"]=safe_div(ni,rev_tot)*100
-    r["سهم سود سهام از درآمد (%)"]=safe_div(div_inc,rev_tot)*100
-    r["درصد سرمایه‌گذاری از دارایی (%)"]=safe_div(total_inv,ta)*100
-    r["نسبت جاری"]=safe_div(d.get("current_assets",np.nan),d.get("current_liab",np.nan))
-    r["Debt/Equity"]=safe_div(d.get("total_liab",np.nan),eq)
-    r["P/E"]=safe_div(p,eps_a) if eps_a and eps_a>0 else np.nan
-    r["P/B"]=safe_div(p,bvps)
-    r["P/NAV (تخمینی)"]=safe_div(p,bvps)
-    r["Market Cap (همت)"]=safe_div(mcap,1e12)
-    # DPS
+    div_inc=d.get("div_income",np.nan); rev_tot=d.get("rev_total",np.nan)
     dps=np.nan
     if d.get("dps_approved") and d.get("capital"):
-        dps=d["dps_approved"]*1e6/(d["capital"]*1e3)  # capital in million rial → shares = capital/1000
-    r["DPS (ریال)"]=dps
-    r["بازده سود نقدی (%)"]=safe_div(dps,p)*100 if not pd.isna(dps) else np.nan
-    return r
+        dps=d["dps_approved"]*1e6/(d["capital"]*1e3)
+    return {
+        "EPS سالانه (ریال)":eps_a,"BVPS (ریال)":bvps,
+        "ROE (%)":safe_div(ni_a,eq)*100,"ROA (%)":safe_div(ni_a,ta)*100,
+        "حاشیه سود خالص (%)":safe_div(ni,rev_tot)*100,
+        "سهم سود سهام از درآمد (%)":safe_div(div_inc,rev_tot)*100,
+        "درصد سرمایه‌گذاری از دارایی (%)":safe_div(total_inv,ta)*100,
+        "نسبت جاری":safe_div(d.get("current_assets",np.nan),d.get("current_liab",np.nan)),
+        "Debt/Equity":safe_div(d.get("total_liab",np.nan),eq),
+        "P/E":safe_div(p,eps_a) if eps_a and eps_a>0 else np.nan,
+        "P/B":safe_div(p,bvps),
+        "P/NAV (تخمینی)":safe_div(p,bvps),
+        "Market Cap (همت)":safe_div(mcap,1e12),
+        "DPS (ریال)":dps,
+        "بازده سود نقدی (%)":safe_div(dps,p)*100 if not pd.isna(dps) else np.nan,
+    }
 
 SECTOR_CONFIG = {
     "holding":{"name":"هلدینگ / سرمایه‌گذاری","labels":HOLDING_LABELS,"fn":holding_ratios,
