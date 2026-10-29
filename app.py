@@ -101,26 +101,22 @@ if uploaded:
                 else: content = bytes(f)
             except Exception as e:
                 file_report.append((f.name, 0, len(cfg["labels"]),
-                                    f"❌ خواندن شکست: {str(e)[:80]}", 0, "?", []))
-                previews[f.name] = {"type": "error", "errors": [str(e)[:200]],
-                                    "hex": "", "size": 0, "kind": "?", "magic": "?"}
+                                    f"❌ خواندن: {str(e)[:60]}", 0, []))
                 continue
 
             if not content:
-                file_report.append((f.name, 0, len(cfg["labels"]), "❌ فایل خالی", 0, "?", []))
+                file_report.append((f.name, 0, len(cfg["labels"]), "❌ خالی", 0, []))
                 continue
 
             size = len(content)
             magic_str = content[:8].hex()
 
             result, kind, errors = parse_any_format(content)
-
             if result is None:
                 file_report.append((f.name, 0, len(cfg["labels"]),
-                                    f"❌ {kind}، {size:,} بایت", 0, magic_str, errors))
+                                    f"❌ {kind}، {size:,} بایت", 0, errors))
                 previews[f.name] = {"type": "error", "errors": errors,
-                                    "hex": content[:80].hex(), "size": size,
-                                    "kind": kind, "magic": magic_str}
+                                    "hex": content[:80].hex(), "kind": kind, "size": size}
                 continue
 
             # پیش‌نمایش
@@ -128,35 +124,37 @@ if uploaded:
                 if isinstance(result, pd.ExcelFile):
                     sample = pd.read_excel(result, sheet_name=result.sheet_names[0],
                                            header=None, nrows=40)
-                    nsheets = len(result.sheet_names)
+                    n_tables = len(result.sheet_names)
+                elif isinstance(result, list):
+                    # بزرگ‌ترین جدول را برای پیش‌نمایش انتخاب کن
+                    biggest = max(result, key=lambda d: d.shape[0] * d.shape[1])
+                    sample = biggest.head(40)
+                    n_tables = len(result)
                 else:
                     sample = result.head(40)
-                    nsheets = 1
-                ncols = sample.shape[1] if not sample.empty else 0
+                    n_tables = 1
                 previews[f.name] = sample
             except Exception as e:
-                file_report.append((f.name, 0, len(cfg["labels"]),
-                                    f"❌ پیش‌نمایش: {str(e)[:60]}", 0, magic_str, []))
                 previews[f.name] = {"type": "error", "errors": [str(e)[:200]],
-                                    "hex": content[:80].hex(), "size": size,
-                                    "kind": kind, "magic": magic_str}
+                                    "hex": content[:80].hex(), "kind": kind, "size": size}
+                file_report.append((f.name, 0, len(cfg["labels"]),
+                                    f"❌ پیش‌نمایش: {str(e)[:60]}", 0, []))
                 continue
 
-            structure = "چندستونی" if ncols > 3 else "تک‌ستونی"
+            ncols = sample.shape[1] if not sample.empty else 0
 
-            # استخراج
             try:
                 extracted = extract_excel(io.BytesIO(content), cfg["labels"])
             except Exception as e:
                 file_report.append((f.name, 0, len(cfg["labels"]),
-                                    f"❌ پارس: {str(e)[:60]}", ncols, magic_str, []))
+                                    f"❌ پارس: {str(e)[:60]}", ncols, []))
                 continue
 
             found = len([k for k, v in extracted.items() if not pd.isna(v)])
             total_fields = len(cfg["labels"])
             file_report.append((f.name, found, total_fields,
-                                f"{structure} ({ncols} ستون، {nsheets} شیت، {kind}، {size:,} بایت)",
-                                ncols, magic_str, []))
+                                f"{kind} | {n_tables} جدول | بزرگ‌ترین: {sample.shape[0]}×{ncols} | {size:,} بایت",
+                                ncols, []))
 
             for k, v in extracted.items():
                 if k not in data or pd.isna(data.get(k)):
@@ -166,8 +164,7 @@ if uploaded:
 # هشدار
 if uploaded and len([k for k, v in data.items() if not pd.isna(v)]) == 0:
     st.markdown(
-        f"<div class='bad-box'>🔴 هیچ داده‌ای استخراج نشد — "
-        f"در «📋 گزارش» و «🔬 نمای خام» تشخیص هر فایل و خطاها را ببینید.</div>",
+        "<div class='bad-box'>🔴 هیچ داده‌ای استخراج نشد — در «نمای خام» نوع، hex، و خطاها را ببینید.</div>",
         unsafe_allow_html=True
     )
 
@@ -195,11 +192,9 @@ if file_report:
             elif isinstance(pv, dict) and pv.get("type") == "error":
                 st.error(f"❌ نوع: `{pv['kind']}` — {pv['size']:,} بایت")
                 c1, c2 = st.columns(2)
-                with c1: st.code(pv["magic"])
-                with c2: st.code(pv["hex"])
-                for err in pv["errors"]: st.code(err)
-            else:
-                st.caption("پیش‌نمایش موجود نیست")
+                with c1: st.code(pv.get("magic", ""))
+                with c2: st.code(pv.get("hex", ""))
+                for err in pv.get("errors", []): st.code(err)
 
 # پوشش
 req = [k for k in cfg["labels"] if not k.endswith("_prev")]
